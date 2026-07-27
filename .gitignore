@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editors ---
+.vscode/
+.idea/
+.DS_Store
+pod_scratch
+artigos/
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Claude Code (per-project) ---
+# Ship shared settings + skills with the repo; keep local overrides + runtime state private.
+.claude/
+
+# --- Experiment outputs (large artefacts) ---
+outputs/archive/
+outputs/deploy_runs/
+outputs/media/
+outputs/logs/
+CLAUDE.md
+context/
+notebooks/scratch/
+scripts
+
+# --- Bulk zips parked at repo root (never commit accidentally) ---
+/*.zip
