@@ -1,3 +1,8 @@
+###############################################################################
+# Project    : Humanoid Loco-Manipulation with the Unitree G1                 #
+# Developer  : Narayane Ribeiro Medeiros                                      #
+# Repository : https://github.com/narayanerm/Humanoid-Loco-Manipulation       #
+###############################################################################
 """Shared utilities for the notebooks: checkpoint discovery, TB parsing, math helpers.
 
 Input:  paths under ``outputs/logs/`` produced by rsl_rl / TensorBoard.
