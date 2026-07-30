@@ -110,6 +110,30 @@ READY_ARM_POSE = {
 READY_ARM_JOINTS = tuple(READY_ARM_POSE.keys())
 
 
+# Curriculum start pose: hands approximately at the box side-face pinch target.
+# Shoulder pitch more negative → arms lower; elbow bent → wrist forward-inward;
+# shoulder roll ±0.20 → hands open sideways to reach the box y=±0.13 faces.
+# Not exact IK — best-effort heuristic. PPO refines from here toward the true
+# pinch geometry defined by _desired_grasp_pos_w.
+PINCH_ARM_POSE = {
+    "left_shoulder_pitch_joint":  -1.20,
+    "left_shoulder_roll_joint":    0.20,
+    "left_shoulder_yaw_joint":     0.0,
+    "left_elbow_joint":            0.90,
+    "left_wrist_roll_joint":       0.0,
+    "left_wrist_pitch_joint":      0.0,
+    "left_wrist_yaw_joint":        0.0,
+    "right_shoulder_pitch_joint": -1.20,
+    "right_shoulder_roll_joint":  -0.20,
+    "right_shoulder_yaw_joint":    0.0,
+    "right_elbow_joint":           0.90,
+    "right_wrist_roll_joint":      0.0,
+    "right_wrist_pitch_joint":     0.0,
+    "right_wrist_yaw_joint":       0.0,
+}
+assert set(PINCH_ARM_POSE.keys()) == set(READY_ARM_POSE.keys()), "PINCH / READY joint sets must match"
+
+
 # Scene and task geometry.
 TABLE_X          = 0.60
 TABLE_HEIGHT     = 0.44
@@ -131,9 +155,13 @@ GRASP_NOMINAL_Y   = 0.13   # left-hand nominal y in box frame (right mirrors)
 GRASP_NOMINAL_Z   = 0.02
 GRASP_JITTER      = 0.03
 
-OBJECT_XY_JITTER_X = 0.10
-OBJECT_XY_JITTER_Y = 0.15
-OBJECT_YAW_RANGE   = 0.30
+# Box always spawns on the table with zero velocity + tight domain randomization:
+# ±5 cm in each xy direction, ±20° in yaw. Discovered that wider jitter (±10-15 cm)
+# combined with hand_bias > 0 was letting the policy "catch the falling box" instead
+# of picking it from the table.
+OBJECT_XY_JITTER_X = 0.05
+OBJECT_XY_JITTER_Y = 0.05
+OBJECT_YAW_RANGE   = math.radians(20.0)
 
 LIFT_X_CENTER   = 0.30
 LIFT_X_HALF     = 0.10
@@ -166,6 +194,24 @@ _SYMMETRIC_PAIRS = (
 _LEFT_SYM_JOINTS  = tuple(p[0] for p in _SYMMETRIC_PAIRS)
 _RIGHT_SYM_JOINTS = tuple(p[1] for p in _SYMMETRIC_PAIRS)
 _SYM_SIGNS        = tuple(float(p[2]) for p in _SYMMETRIC_PAIRS)
+
+
+# Full 29-joint mirror map for PPO data augmentation.
+# Format: for i in [0, 29), _JOINT_MIRROR_MAP[i] = (j, sign) such that
+# mirrored_joint[i] = sign * original_joint[j] under a sagittal-plane mirror
+# (world y=0, robot yaw ≈ 0 — valid for pick since the robot faces the table
+# along +x for the whole episode).
+# Sign convention matches _SYMMETRIC_PAIRS: pitch/knee/elbow = +1; roll = -1;
+# yaw = +1 for arm/hip joints (G1's per-joint frame absorbs the mirror), -1
+# for the centerline waist_yaw and waist_roll (true axial rotations).
+_JOINT_MIRROR_MAP = (
+    ( 6, +1.0), ( 7, -1.0), ( 8, +1.0), ( 9, +1.0), (10, +1.0), (11, -1.0),  # left leg → right leg
+    ( 0, +1.0), ( 1, -1.0), ( 2, +1.0), ( 3, +1.0), ( 4, +1.0), ( 5, -1.0),  # right leg → left leg
+    (12, -1.0), (13, -1.0), (14, +1.0),                                      # waist yaw/roll flip; pitch keeps
+    (22, +1.0), (23, -1.0), (24, +1.0), (25, +1.0), (26, -1.0), (27, +1.0), (28, +1.0),  # left arm → right arm
+    (15, +1.0), (16, -1.0), (17, +1.0), (18, +1.0), (19, -1.0), (20, +1.0), (21, +1.0),  # right arm → left arm
+)
+assert len(_JOINT_MIRROR_MAP) == len(G1_JOINTS), "_JOINT_MIRROR_MAP out of sync with G1_JOINTS"
 
 
 # Scene builders.
@@ -328,12 +374,13 @@ def reset_arms_to_ready(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
+    pinch_bias: float = 0.0,
 ) -> None:
-    """Snap the 14 arm joints to READY_ARM_POSE right after reset_from_walk_buffer.
-    Puts hands forward-down (roughly above the box) so the policy starts closer
-    to the reach target and avoids the random-init arm scramble that kept
-    ep_length pinned at ~9 in early training.
-    Args: env — RL env; env_ids — envs to reset (None = all); asset_cfg — robot entity selecting the 14 arm joints.
+    """Snap the 14 arm joints to a blend of PINCH_ARM_POSE and READY_ARM_POSE.
+    pinch_bias=1.0 → PINCH (hands close to grasp target, curriculum start).
+    pinch_bias=0.0 → READY (hands forward-down above box, curriculum end).
+    Linear interpolation between the two.
+    Args: env — RL env; env_ids — envs to reset (None = all); asset_cfg — robot entity selecting the 14 arm joints; pinch_bias — blend in [0, 1], ramped by pick_curriculum.
     Returns: none.
     """
     if env_ids is None:
@@ -347,8 +394,9 @@ def reset_arms_to_ready(
         joint_ids_t = torch.tensor(joint_ids, device=env.device)
     else:
         joint_ids_t = joint_ids
+    pb = float(max(0.0, min(1.0, pinch_bias)))
     pose = torch.tensor(
-        [READY_ARM_POSE[j] for j in asset_cfg.joint_names],
+        [pb * PINCH_ARM_POSE[j] + (1.0 - pb) * READY_ARM_POSE[j] for j in asset_cfg.joint_names],
         device=env.device,
     ).unsqueeze(0).expand(n, -1).clone()
     vel = torch.zeros_like(pose)
@@ -359,10 +407,9 @@ def reset_pick_command_and_object(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     scale: float = 1.0,
-    hand_bias: float = 0.0,
 ) -> None:
-    """Sample the 20-D command and write the box spawn so they match.
-    Args: env — the RL env; env_ids — envs to reset (all if None); scale — curriculum range multiplier in [0, 1]; hand_bias — curriculum interpolation in [0, 1] between "box on table" (0) and "box already in hands at chest" (1). Set to 1.0 early in training so the policy discovers the lift phase before having to reach; ramped down to 0 by pick_curriculum.
+    """Sample the 20-D command and write the box spawn on the table.
+    Args: env — the RL env; env_ids — envs to reset (all if None); scale — curriculum range multiplier in [0, 1] applied to xy/yaw jitter.
     Returns: none.
     """
     from mjlab.utils.lab_api.math import sample_uniform, quat_from_euler_xyz
@@ -378,22 +425,16 @@ def reset_pick_command_and_object(
     origins = env.scene.env_origins[env_ids]
     zero = torch.zeros(n, device=device)
 
-    # Box spawn: interpolate between table position (default) and "in hands"
-    # (chest height, close to the robot spawn) based on hand_bias. Jitter
-    # only applies to the table component so the "in hands" pose is stable.
+    # Box always spawns at rest on the table (no "in hands" branch): removed the
+    # hand_bias interpolation because the policy was learning to catch the box
+    # mid-fall instead of picking it up from the surface.
     ox = sample_uniform(-OBJECT_XY_JITTER_X * scale, OBJECT_XY_JITTER_X * scale, (n,), device=device)
     oy = sample_uniform(-OBJECT_XY_JITTER_Y * scale, OBJECT_XY_JITTER_Y * scale, (n,), device=device)
     o_yaw = sample_uniform(-OBJECT_YAW_RANGE * scale, OBJECT_YAW_RANGE * scale, (n,), device=device)
-    table_x = BOX_START_X + ox
-    table_z = torch.full((n,), BOX_START_Z, device=device)
-    # "In hands" target: right at the estimated READY_ARM_POSE hand position.
-    hands_x = torch.full((n,), 0.46, device=device)
-    hands_z = torch.full((n,), 0.79, device=device)
-    hb = float(max(0.0, min(1.0, hand_bias)))
     obj_pos_w = torch.stack([
-        origins[:, 0] + (1.0 - hb) * table_x + hb * hands_x,
-        origins[:, 1] + (1.0 - hb) * oy,
-        origins[:, 2] + (1.0 - hb) * table_z + hb * hands_z,
+        origins[:, 0] + BOX_START_X + ox,
+        origins[:, 1] + oy,
+        origins[:, 2] + BOX_START_Z,
     ], dim=-1)
     obj_quat_w = quat_from_euler_xyz(zero, zero, o_yaw)
 
@@ -512,24 +553,26 @@ def cmd_lift_target_quat_obs(env):
     return env.extras[_CMD_KEY + "lift_target_quat"]
 
 
-# Reach-style rewards adapted so the target is the box side.
+# Carry-style fixed side-face target: forces wrist-pinching geometry instead of
+# single-sphere gripping. Left wrist targets +y face of box; right wrist targets -y face.
+# Deterministic (no per-episode jitter) so the policy converges to the pinch pose.
 def _desired_grasp_pos_w(env, box_cfg, side: str) -> torch.Tensor:
-    """Return world-frame position of the commanded grasp point for one hand.
+    """Return world-frame position of the wrist-pinch target on the box side face.
     Args: env — the RL env; box_cfg — box entity config; side — "left" or "right".
-    Returns: (num_envs, 3) tensor of grasp points on the box side.
+    Returns: (num_envs, 3) tensor of pinch points on the box side.
     """
-    _ensure_cmd_buffers(env)
     box_w    = _entity_pos(env, box_cfg)
     box_quat = env.scene[box_cfg.name].data.root_link_quat_w
     qw, qx, qy, qz = box_quat.unbind(dim=-1)
     box_yaw = torch.atan2(2.0 * (qw * qz + qx * qy),
                           1.0 - 2.0 * (qy * qy + qz * qz))
     cy, sy = torch.cos(box_yaw), torch.sin(box_yaw)
-    off = env.extras[_CMD_KEY + f"grasp_offset_{side}"]
-    ox, oy, oz = off.unbind(dim=-1)
-    wx = cy * ox - sy * oy
-    wy = sy * ox + cy * oy
-    return box_w + torch.stack([wx, wy, oz], dim=-1)
+    # +y outward normal of box in world xy is (-sin_yaw, cos_yaw); flip for right side.
+    sign = 1.0 if side == "left" else -1.0
+    dx = -sign * GRASP_NOMINAL_Y * sy
+    dy =  sign * GRASP_NOMINAL_Y * cy
+    dz = torch.full_like(box_w[:, 2], GRASP_NOMINAL_Z)
+    return box_w + torch.stack([dx, dy, dz], dim=-1)
 
 
 def reach_reward(env, hand_cfg, box_cfg, side: str, std: float = 0.20):
@@ -662,21 +705,6 @@ def dof_torque_l2(env):
     """ETH standard: squared L2 on joint torques (energy proxy)."""
     tau = env.scene["robot"].data.qfrc_actuator
     return torch.sum(tau * tau, dim=-1)
-
-
-def grip_force_reward(env, sensor_name: str = "hand_box_contact",
-                      target_force: float = 5.0):
-    """Reward positive normal force between robot and box, saturating at target_force.
-    Args: env — RL env; sensor_name — ContactSensor name; target_force — N at which reward saturates.
-    Returns: (num_envs,) tensor in [0, 1]. Ground-truth signal that grip is firm.
-    """
-    sensor = env.scene[sensor_name]
-    if sensor.data.force is not None:
-        force_mag = torch.linalg.norm(sensor.data.force, dim=-1)
-        force_sum = force_mag.sum(dim=-1)
-    else:
-        force_sum = sensor.data.found.sum(dim=-1).float()
-    return torch.clamp(force_sum / target_force, 0.0, 1.0)
 
 
 def hand_approach_velocity_penalty(env, left_hand_cfg, right_hand_cfg, box_cfg,
@@ -817,6 +845,14 @@ def box_front_aligned_reward(env, box_cfg):
     return torch.clamp(cos_diff, 0.0, 1.0)
 
 
+def box_orientation_reward(env, box_cfg) -> torch.Tensor:
+    """Fused (not lift-gated) orientation reward: box +z aligned with world +z AND box +x aligned with robot heading.
+    Args: env — RL env; box_cfg — box entity.
+    Returns: (num_envs,) reward in [0, 2] (sum of two clamped cosines). Copied from policy_carry.
+    """
+    return box_upright_reward(env, box_cfg) + box_front_aligned_reward(env, box_cfg)
+
+
 def box_carry_pose_bundle_reward(env, box_cfg,
                                   w_upright: float = 1.5,
                                   w_front: float = 1.5,
@@ -948,6 +984,17 @@ def upright_torso_reward(env, trunk_cfg):
     x, y = quat[:, 1], quat[:, 2]
     up_z = 1.0 - 2.0 * (x * x + y * y)
     return torch.clamp(up_z, 0.0, 1.0)
+
+
+def alive_bonus(env) -> torch.Tensor:
+    """Constant +1 per surviving step — dense survival signal that dominates the
+    early sparse-grasp-reward phase, matching walk's implicit "stay upright to
+    keep tracking" gradient. Weighted small (~0.5) so it doesn't drown out
+    grasp/lift once those start firing.
+    Args: env — RL env.
+    Returns: (num_envs,) tensor of ones.
+    """
+    return torch.ones(env.num_envs, device=env.device)
 
 
 def fell_over_penalty(env, trunk_cfg,
@@ -1191,13 +1238,23 @@ _WALK_BUFFER_CACHE: dict[str, torch.Tensor] | None = None
 
 
 def _load_walk_buffer(path: str, device: torch.device,
-                      min_upright: float = 0.90) -> dict[str, torch.Tensor]:
-    """Load the .npz walk-terminal buffer once and cache tensors on device.
-    Filters entries to keep only "stable" snapshots: trunk upright (up_z from
-    quat_zy >= min_upright, i.e. ~<25° tilt). This drops the mid-walk
-    catastrophic entries that used to catapult the pick reset into a 9-step
-    fall. Filter is applied once at load time and cached.
-    Args: path — path to the .npz buffer; device — torch device; min_upright — minimum quat-derived up_z to keep an entry (0.90 ≈ 25° tilt).
+                      min_upright: float   = 0.98,
+                      root_z_range: tuple[float, float] = (0.72, 0.78),
+                      max_lin_vel: float   = 0.40,
+                      max_ang_vel: float   = 0.60,
+                      max_joint_vel: float = 4.00) -> dict[str, torch.Tensor]:
+    """Load and filter the .npz walk-terminal buffer to keep only near-static entries.
+    Filter (all conditions must hold) — drops mid-cycle snapshots where a foot is up
+    or the robot is mid-stride, keeps only frames where the walk policy happened
+    to be transitioning through a quasi-static pose:
+      * trunk upright: up_z from quat_zy >= min_upright (~<18° tilt at 0.95)
+      * root height inside range (default 0.70-0.80 m, brackets the G1 standing height)
+      * base linear velocity magnitude <= max_lin_vel
+      * base angular velocity magnitude <= max_ang_vel
+      * max |joint velocity| across joints <= max_joint_vel
+    If the filter leaves fewer than 1024 or n_before/20 entries, falls back to
+    unfiltered (avoids resample lockup).
+    Args: path — buffer file; device — torch device; min_upright/root_z_range/max_lin_vel/max_ang_vel/max_joint_vel — filter thresholds (see above).
     Returns: dict of buffer name to tensor (plus a "_path" sentinel).
     """
     global _WALK_BUFFER_CACHE
@@ -1212,18 +1269,34 @@ def _load_walk_buffer(path: str, device: torch.device,
             )
         arr = _np.load(p)
         cache = {k: torch.from_numpy(arr[k]).float().to(device) for k in arr.files}
-        # Filter: keep only entries where the trunk is roughly upright.
-        # quat_zy is stored as (w, x, y, z); up_z = 1 - 2*(x^2 + y^2).
+
+        # quat_zy = (w, x, y, z); up_z = 1 - 2*(x^2 + y^2) (yaw already stripped).
         q = cache["quat_zy"]
         x, y = q[:, 1], q[:, 2]
         up_z = 1.0 - 2.0 * (x * x + y * y)
-        keep = up_z >= min_upright
+        root_z = cache["root_z"].squeeze(-1)
+        lin_vel_norm = cache["lin_vel_by"].norm(dim=-1)
+        ang_vel_norm = cache["ang_vel_by"].norm(dim=-1)
+        joint_vel_max = cache["joint_vel"].abs().max(dim=-1).values
+
+        keep = (
+            (up_z >= min_upright)
+            & (root_z >= root_z_range[0]) & (root_z <= root_z_range[1])
+            & (lin_vel_norm <= max_lin_vel)
+            & (ang_vel_norm <= max_ang_vel)
+            & (joint_vel_max <= max_joint_vel)
+        )
         n_before = q.shape[0]
         n_after  = int(keep.sum().item())
+        print(f"[walk_buffer filter] kept {n_after}/{n_before} entries "
+              f"({100.0 * n_after / n_before:.1f}%)")
+
         if n_after < max(1024, n_before // 20):
-            # Filter left too little — fall back to unfiltered (avoids resample lock).
+            print(f"[walk_buffer filter] fell below fallback threshold "
+                  f"(max(1024, n/20) = {max(1024, n_before // 20)}) — using unfiltered buffer instead.")
             keep = torch.ones_like(keep)
             n_after = n_before
+
         for k in list(cache.keys()):
             if isinstance(cache[k], torch.Tensor) and cache[k].shape[0] == n_before:
                 cache[k] = cache[k][keep].contiguous()
@@ -1361,26 +1434,29 @@ def reset_from_walk_buffer(
 
 # Curriculum.
 def pick_curriculum(env, env_ids):
-    """Widen the reset-base jitter, command ranges, and shift the box from
-    in-hands to on-table across training stages.
+    """Widen the reset-base jitter, object DR jitter, and unwind the pinch-arm bias.
+    pinch_bias starts at 1.0 (hands already pinching the box) so the policy first
+    sees a solved-grip state, then ramps to 0.0 (raw READY_ARM_POSE) so it must
+    learn the reach+grip end-to-end. Timing mirrors the scale ramp: constant
+    pinch=1 during scale=0.30, linear ramp during the scale bump, constant
+    pinch=0 once the environment is at full difficulty.
     Args: env — the RL env; env_ids — envs being updated (unused, curriculum is global).
-    Returns: dict with the current pick_scale and hand_bias for logging.
+    Returns: dict with pick_scale and pick_pinch_bias for logging.
     """
     step = int(getattr(env, "common_step_counter", 0))
     if step < 2_000_000:
         scale = 0.30
-        hand_bias = 1.0                    # box spawns in the hands — grasp is trivial, learn to lift
+        pinch_bias = 1.0
     elif step < 4_000_000:
-        # Ease box onto the table over this window.
         t = (step - 2_000_000) / (4_000_000 - 2_000_000)
         scale = 0.30 + 0.35 * t
-        hand_bias = 1.0 - t
+        pinch_bias = 1.0 - t
     elif step < 6_000_000:
         scale = 0.65
-        hand_bias = 0.0                    # box on table, full pick task
+        pinch_bias = 0.0
     else:
         scale = 1.00
-        hand_bias = 0.0
+        pinch_bias = 0.0
     xy_range  = (-0.12 * scale, 0.12 * scale)
     yaw_range = (-0.30 * scale, 0.30 * scale)
     try:
@@ -1391,11 +1467,15 @@ def pick_curriculum(env, env_ids):
         pass
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_pick_cmd")
-        term_cfg.params["scale"]     = scale
-        term_cfg.params["hand_bias"] = hand_bias
+        term_cfg.params["scale"] = scale
     except Exception:
         pass
-    return {"pick_scale": scale, "pick_hand_bias": hand_bias}
+    try:
+        term_cfg = env.event_manager.get_term_cfg("reset_arms_ready")
+        term_cfg.params["pinch_bias"] = pinch_bias
+    except Exception:
+        pass
+    return {"pick_scale": scale, "pick_pinch_bias": pinch_bias}
 
 
 # MDP assembly.
@@ -1447,20 +1527,6 @@ def build_g1_pick_mdp():
         reduce="netforce",
         num_slots=1,
         track_air_time=True,
-    )
-    hand_box_contact_cfg = ContactSensorCfg(
-        name="hand_box_contact",
-        # Narrowed from subtree "pelvis" (the whole robot) to just the wrist
-        # subtrees so grip_force_reward is not paid for leg / torso contact.
-        primary=ContactMatch(
-            mode="subtree",
-            pattern=r"^(left|right)_wrist_yaw_link$",
-            entity="robot",
-        ),
-        secondary=ContactMatch(mode="body", pattern="box", entity="box"),
-        fields=("found", "force"),
-        reduce="netforce",
-        num_slots=4,
     )
     self_collision_cfg = ContactSensorCfg(
         name="self_collision",
@@ -1581,15 +1647,6 @@ def build_g1_pick_mdp():
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "w_left": 0.5, "w_right": 0.5},
         ),
-        # Commanded grasp and lift target (both read from env.extras).
-        # Real contact-force reward — replaces the removed gentle_grasp penalty
-        # that punished box angular velocity when hands close (taught the
-        # policy to grip weakly to avoid micro-oscillations). Saturates at 20 N
-        # (was 5 N — too easy: 2-3 N barely-touching light grip already got
-        # 60-80% of the reward, no incentive to actually squeeze).
-        "grip_force": RewardTermCfg(func=grip_force_reward, weight=5.0,
-                                    params={"sensor_name": "hand_box_contact",
-                                            "target_force": 20.0}),
         # Lift target: asymmetric z-kernel (broad below to pull up from squat,
         # narrow above to punish overshoot). Weight bumped 2.0 -> 4.0.
         "box_at_lift_target_pos":  RewardTermCfg(func=gated_box_at_lift_target_pos_reward,  weight=4.0,
@@ -1598,7 +1655,12 @@ def build_g1_pick_mdp():
                                                          "sigma_xy": 0.30,
                                                          "sigma_z_below": 0.30,
                                                          "sigma_z_above": 0.08}),
-        # Fused: box_upright + box_front_aligned + box_at_chest → box_carry_pose_bundle (w=1.5 each folded in).
+        # Always-on box orientation (carry-style): rewards box upright + facing
+        # the robot's heading. Provides a gradient against the ±20° spawn jitter
+        # so the policy learns to keep the box aligned from tick 0, not only
+        # after lift.
+        "box_orientation": RewardTermCfg(func=box_orientation_reward, weight=1.5, params={"box_cfg": box}),
+        # Lift-gated fused: box_upright + box_front_aligned + box_at_chest → box_carry_pose_bundle.
         "box_carry_pose": RewardTermCfg(
             func=box_carry_pose_bundle_reward, weight=1.0,
             params={"box_cfg": box, "w_upright": 1.5, "w_front": 1.5, "w_chest": 1.5},
@@ -1624,6 +1686,11 @@ def build_g1_pick_mdp():
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
         ),
+        # Dense survival signal — pays every surviving step, dominates the
+        # early sparse-grasp phase so the policy first learns "don't die",
+        # then "reach and grip". Weight small so it doesn't drown out the
+        # grasp / lift rewards once those start firing.
+        "alive_bonus":    RewardTermCfg(func=alive_bonus, weight=0.5, params={}),
         # Weight -0.5 -> -2.0: at -0.5 the penalty was negligible during the
         # hold phase (~0.1-0.5 units of motion × 0.5 ≈ trivial vs +30 stability
         # + +5 grip_force), so the policy jittered its arms freely while
@@ -1685,34 +1752,37 @@ def build_g1_pick_mdp():
 
     # Events: warm-buffer reset, command/box reset, domain randomization.
     events = {
-        # Was reset_from_walk_buffer — swapped for reset_from_home_pose:
-        # the walk buffer contains mid-cycle snapshots (foot up, tronco
-        # tilted) that catapulted training into ~9-step falls before the
-        # policy could react. Canonical home pose gives every env the
-        # same stable start, matching drop's "reset already satisfies
-        # stability" advantage.
+        # Walk buffer with strict stability filter (see _load_walk_buffer):
+        # only entries where the walk policy passed through a quasi-static
+        # pose (upright, standing height, low velocities) are sampled. This
+        # gives the pick reset the walking-realistic distribution (pose
+        # variety, subtle joint offsets) without the mid-cycle "foot in the
+        # air" snapshots that used to trigger the 9-step-fall failure mode.
         "reset_base": EventTermCfg(
-            func=reset_from_home_pose,
+            func=reset_from_walk_buffer,
             mode="reset",
             params={
+                "buffer_path": WALK_BUFFER_PATH,
                 "xy_range":  (-0.12, 0.12),
                 "yaw_range": (-0.30, 0.30),
                 "asset_cfg": g1_asset,
             },
         ),
-        # Snap arms to READY_ARM_POSE right after the walk-buffer reset so the
-        # policy doesn't have to discover "hands roughly toward box" via random
-        # exploration — cuts early-training ep_length collapse from ~9 steps.
+        # Snap arms after the walk-buffer reset. Blend between PINCH_ARM_POSE
+        # (hands already at the box grasp target — curriculum start) and
+        # READY_ARM_POSE (hands forward-down above box — curriculum end).
+        # Default pinch_bias=1.0 (start of curriculum); pick_curriculum ramps
+        # it to 0.0 over training. Cuts early-training ep_length collapse.
         "reset_arms_ready": EventTermCfg(
             func=reset_arms_to_ready,
             mode="reset",
-            params={"asset_cfg": arm_asset},
+            params={"asset_cfg": arm_asset, "pinch_bias": 1.0},
         ),
         # Samples the 20-D command and writes the matching box spawn.
         "reset_pick_cmd": EventTermCfg(
             func=reset_pick_command_and_object,
             mode="reset",
-            params={"scale": 0.30, "hand_bias": 1.0},   # both overwritten by pick_curriculum
+            params={"scale": 0.30},   # overwritten by pick_curriculum
         ),
         "push_robot": EventTermCfg(
             func=vel_mdp.push_by_setting_velocity,
@@ -1812,7 +1882,7 @@ def build_g1_pick_mdp():
         "robot_cfg": robot_cfg,
         "table_cfg": table_cfg,
         "box_cfg":   box_cfg_e,
-        "sensors":   (feet_ground_cfg, hand_box_contact_cfg, self_collision_cfg, body_table_contact_cfg, body_box_contact_cfg, foot_height_scan_cfg),
+        "sensors":   (feet_ground_cfg, self_collision_cfg, body_table_contact_cfg, body_box_contact_cfg, foot_height_scan_cfg),
         "observations": observations,
         "actions":      actions,
         "rewards":      rewards,
@@ -1820,6 +1890,162 @@ def build_g1_pick_mdp():
         "terminations": terminations,
         "curriculum":   curriculum,
     }
+
+
+# PPO mirror data augmentation.
+# The mirror hypothesis: for a symmetric task like pick, any (obs, action)
+# pair reflected across the robot's sagittal plane is equally valid training
+# data. Doubling the effective sample size via mirror augmentation biases
+# the policy toward left-right symmetric strategies (like wrist-pinching).
+#
+# Assumption: robot's sagittal plane ≈ world y=0 plane. Valid for pick
+# because the robot spawns facing +x and stays there (no yaw command).
+# Would break for locomotion policies where yaw varies freely.
+_PICK_OBS_LAYOUT = (
+    # (term_name, dim, mirror_op) — MUST match the actor_terms dict order in
+    # build_pick_mdp exactly. Terms with mirror_op="pair_left" MUST be
+    # immediately followed by a "pair_right" of the same dim; they swap.
+    ("base_lin_vel",           3, "vec_body"),      # [x,-y,z]
+    ("base_ang_vel",           3, "pseudo_body"),   # [-x,y,-z] (angular vel is a pseudovector)
+    ("projected_gravity",      3, "vec_body"),
+    ("joint_pos",             29, "joints"),
+    ("joint_vel",             29, "joints"),
+    ("actions",               29, "joints"),
+    ("left_hand_to_box",       3, "pair_left"),     # swap with right, then vec_body flip
+    ("right_hand_to_box",      3, "pair_right"),
+    ("trunk_to_box",           3, "vec_body"),      # trunk is centerline
+    ("wrist_torque",           6, "wrist_torque"),  # 3 left + 3 right actuators, swap+sign
+    ("box_pos",                3, "vec_body"),      # body-relative delta
+    ("box_lin_vel",            3, "vec_body"),
+    ("box_ang_vel",            3, "pseudo_body"),
+    ("box_orientation",        4, "quat"),          # (w, -x, y, -z)
+    ("box_size",               3, "identity"),
+    ("cmd_grasp_offset_left",  3, "pair_left"),
+    ("cmd_grasp_offset_right", 3, "pair_right"),
+    ("cmd_object_target_pos",  3, "vec_body"),
+    ("cmd_object_target_quat", 4, "quat"),
+    ("cmd_lift_target_pos",    3, "vec_body"),
+    ("cmd_lift_target_quat",   4, "quat"),
+)
+
+
+def _mirror_joint_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Apply _JOINT_MIRROR_MAP to the last-dim = 29 joint-ordered tensor.
+    Args: t — tensor (..., 29).
+    Returns: tensor (..., 29) with joints swapped left↔right and signs applied.
+    """
+    idx  = torch.tensor([m[0] for m in _JOINT_MIRROR_MAP], device=t.device, dtype=torch.long)
+    sign = torch.tensor([m[1] for m in _JOINT_MIRROR_MAP], device=t.device, dtype=t.dtype)
+    return t.index_select(-1, idx) * sign
+
+
+# Wrist actuators, in the order emitted by wrist_actuator_force_obs (from wrist_acts
+# SceneEntityCfg with pattern r".*wrist.*"). G1_JOINTS gives us canonical order.
+_WRIST_ACTUATOR_INDICES = tuple(i for i, j in enumerate(G1_JOINTS) if "wrist" in j)  # 6 indices
+# Mirror map restricted to the 6 wrist actuators: swap left↔right + signs.
+_WRIST_MIRROR = tuple(
+    (
+        _WRIST_ACTUATOR_INDICES.index(_JOINT_MIRROR_MAP[wi][0]),
+        _JOINT_MIRROR_MAP[wi][1],
+    )
+    for wi in _WRIST_ACTUATOR_INDICES
+)
+
+
+def _mirror_wrist_torque(t: torch.Tensor) -> torch.Tensor:
+    """Swap and sign-flip the 6 wrist actuator torques.
+    Args: t — tensor (..., 6).
+    Returns: tensor (..., 6) mirrored.
+    """
+    idx  = torch.tensor([m[0] for m in _WRIST_MIRROR], device=t.device, dtype=torch.long)
+    sign = torch.tensor([m[1] for m in _WRIST_MIRROR], device=t.device, dtype=t.dtype)
+    return t.index_select(-1, idx) * sign
+
+
+def _mirror_obs_slice(chunk: torch.Tensor, op: str) -> torch.Tensor:
+    """Apply the given mirror op to one obs slice.
+    Args: chunk — tensor (..., dim); op — mirror-op string from _PICK_OBS_LAYOUT.
+    Returns: mirrored slice (same shape as chunk).
+    """
+    if op == "identity":
+        return chunk
+    if op == "vec_body":
+        out = chunk.clone(); out[..., 1] = -out[..., 1]; return out
+    if op == "pseudo_body":
+        out = chunk.clone(); out[..., 0] = -out[..., 0]; out[..., 2] = -out[..., 2]; return out
+    if op == "quat":
+        out = chunk.clone(); out[..., 1] = -out[..., 1]; out[..., 3] = -out[..., 3]; return out
+    if op == "joints":
+        return _mirror_joint_tensor(chunk)
+    if op == "wrist_torque":
+        return _mirror_wrist_torque(chunk)
+    raise ValueError(f"unknown mirror op: {op}")
+
+
+def _mirror_obs(obs: torch.Tensor) -> torch.Tensor:
+    """Mirror the flat actor obs tensor by walking _PICK_OBS_LAYOUT slice by slice.
+    Handles 'pair_left'/'pair_right' by swapping the two contiguous chunks (both are
+    body-frame vecs, so also apply vec_body after the swap).
+    Args: obs — tensor (batch, total_dim).
+    Returns: tensor (batch, total_dim) mirrored.
+    """
+    parts: list[torch.Tensor] = []
+    i = 0
+    idx = 0
+    layout = _PICK_OBS_LAYOUT
+    while idx < len(layout):
+        name, dim, op = layout[idx]
+        if op == "pair_left":
+            # peek next; must be pair_right of the same dim.
+            _, dim_r, op_r = layout[idx + 1]
+            assert op_r == "pair_right" and dim_r == dim, f"pair mismatch at {name}"
+            left  = obs[..., i:i + dim]
+            right = obs[..., i + dim:i + 2 * dim]
+            # After sagittal mirror: what was on the right is now on the left, and
+            # each swapped chunk also has its y component flipped (body-frame vec).
+            parts.append(_mirror_obs_slice(right, "vec_body"))
+            parts.append(_mirror_obs_slice(left,  "vec_body"))
+            i += 2 * dim
+            idx += 2
+        else:
+            parts.append(_mirror_obs_slice(obs[..., i:i + dim], op))
+            i += dim
+            idx += 1
+    assert i == obs.shape[-1], (
+        f"obs mirror layout mismatch: consumed {i} dims, obs has {obs.shape[-1]}. "
+        f"Verify _PICK_OBS_LAYOUT matches the actor_terms dict in build_pick_mdp."
+    )
+    return torch.cat(parts, dim=-1)
+
+
+def mirror_pick_augmentation(env, obs=None, actions=None, obs_type: str = "policy"):
+    """rsl_rl data_augmentation_func: return the mirrored (obs, actions) pair.
+    Accepts plain torch tensors OR TensorDicts (rsl_rl 5.x wraps obs as TensorDict
+    with actor/critic leaves that share pick's layout).
+    Args: env — VecEnv wrapper (unused; kept for API); obs — (batch, obs_dim) tensor or TensorDict or None; actions — (batch, action_dim) tensor or TensorDict or None; obs_type — 'policy' or 'critic', both share the same 147-dim layout in pick.
+    Returns: (mirrored_obs, mirrored_actions), each None if the input was None.
+    """
+    def _apply_mirror(x, fn):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            return fn(x)
+        # TensorDict: apply fn to every leaf tensor.
+        return x.apply(fn)
+
+    return (
+        _apply_mirror(obs, _mirror_obs),
+        _apply_mirror(actions, _mirror_joint_tensor),
+    )
+
+
+# Wired into the runner by train_loop.py when this constant is present on the module.
+SYMMETRY_CFG = {
+    "use_data_augmentation": True,
+    "use_mirror_loss": False,
+    "mirror_loss_coeff": 0.0,
+    "data_augmentation_func": mirror_pick_augmentation,
+}
 
 
 def g1_pick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
