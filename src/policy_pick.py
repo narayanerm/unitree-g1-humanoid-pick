@@ -112,17 +112,11 @@ PINCH_POSE = {
     "right_wrist_roll_joint":      0.0,
     "right_wrist_pitch_joint":     0.0,
     "right_wrist_yaw_joint":       0.0,
-    # Torso leans forward + legs bend to keep CoM over the feet. Without the
-    # hip/knee/ankle compensation, the 23-degree torso lean tips the robot
-    # forward on tick 0 and every episode dies before the policy can react
-    # (the ~1000-iter ep_length stall observed empirically).
+    # Torso leans forward via waist only. Leg override reverted (hip/knee/ankle
+    # bend was tipping the whole robot forward because walk-buffer snapshots
+    # already carry small root-pitch residuals; stacking joint bend on top of
+    # that changed the base orientation instead of just the spine).
     "waist_pitch_joint":           0.40,
-    "left_hip_pitch_joint":        0.30,
-    "left_knee_joint":             0.30,
-    "left_ankle_pitch_joint":     -0.15,
-    "right_hip_pitch_joint":       0.30,
-    "right_knee_joint":            0.30,
-    "right_ankle_pitch_joint":    -0.15,
 }
 PINCH_JOINTS = tuple(PINCH_POSE.keys())
 
@@ -133,7 +127,7 @@ TABLE_HEIGHT     = 0.44
 TABLE_TOP_HALF   = 0.04
 TABLE_TOP_Z      = TABLE_HEIGHT + TABLE_TOP_HALF   # top surface where the box sits
 BOX_HALF         = 0.105
-BOX_START_X      = TABLE_X - 0.09
+BOX_START_X      = TABLE_X - 0.19
 BOX_START_Z      = TABLE_TOP_Z + BOX_HALF
 BOX_MASS_MIN     = 0.30
 BOX_MASS_MAX     = 3.00
@@ -1416,9 +1410,10 @@ def reset_from_walk_buffer(
     xy_range: tuple[float, float],
     yaw_range: tuple[float, float],
     asset_cfg: SceneEntityCfg,
+    x_offset: float = 0.0,
 ) -> None:
     """Sample a walk-terminal state per env and write it to the robot, with jitter.
-    Args: env — the RL env; env_ids — envs to reset (all if None); buffer_path — path to the .npz buffer; xy_range — additive xy jitter bounds; yaw_range — additive yaw jitter bounds in rad; asset_cfg — robot entity config.
+    Args: env — the RL env; env_ids — envs to reset (all if None); buffer_path — path to the .npz buffer; xy_range — additive xy jitter bounds; yaw_range — additive yaw jitter bounds in rad; asset_cfg — robot entity config; x_offset — fixed forward shift added to root x (positive moves toward the table).
     Returns: none.
     """
     from mjlab.utils.lab_api.math import (
@@ -1457,6 +1452,7 @@ def reset_from_walk_buffer(
     origins = env.scene.env_origins[env_ids]
 
     root_xy = default_root_state[:, 0:2] + xy_jitter + origins[:, 0:2]
+    root_xy[:, 0] = root_xy[:, 0] + x_offset
     root_z_w = root_z + origins[:, 2:3]
     positions = torch.cat([root_xy, root_z_w], dim=-1)
 
@@ -1830,6 +1826,11 @@ def build_g1_pick_mdp():
                 "xy_range":  (-0.12, 0.12),
                 "yaw_range": (-0.30, 0.30),
                 "asset_cfg": g1_asset,
+                # -0.02 shifts the robot ~10 cm back from the previous 0.08.
+                # Together with BOX_START_X moved 10 cm back on the tabletop,
+                # this keeps the same reach geometry but pulls the whole scene
+                # away from the table edge for a cleaner visual.
+                "x_offset": -0.02,
             },
         ),
         # Snap arms after the walk-buffer reset. Blend between PINCH_ARM_POSE
