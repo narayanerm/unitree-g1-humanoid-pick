@@ -85,53 +85,46 @@ G1_FOOT_GEOMS = tuple(
 # and drops ep_length from 9 to something usable from tick 0.
 # Not fully closed like HOLDING_ARM_POSE — the policy still has to descend
 # and squeeze to actually grasp the box.
-READY_ARM_POSE = {
-    # Arms nearly extended toward the box: shoulder pitch pushes upper arm
-    # forward-down (~49° from vertical), elbow only mildly bent so the
-    # forearm continues the line. Hands end up at estimated x≈0.46, z≈0.79
-    # (world), ~20 cm from the box anchor at (0.51, ±0.13, 0.605) — the
-    # closest reachable point given the home spawn xy. Shoulder roll near
-    # zero so hands sit close to the sagittal plane (box y=0).
-    "left_shoulder_pitch_joint":  -0.85,
-    "left_shoulder_roll_joint":    0.05,
-    "left_shoulder_yaw_joint":     0.0,
-    "left_elbow_joint":            0.15,
-    "left_wrist_roll_joint":       0.0,
-    "left_wrist_pitch_joint":      0.0,
-    "left_wrist_yaw_joint":        0.0,
-    "right_shoulder_pitch_joint": -0.85,
-    "right_shoulder_roll_joint":  -0.05,
-    "right_shoulder_yaw_joint":    0.0,
-    "right_elbow_joint":           0.15,
-    "right_wrist_roll_joint":      0.0,
-    "right_wrist_pitch_joint":     0.0,
-    "right_wrist_yaw_joint":       0.0,
-}
-READY_ARM_JOINTS = tuple(READY_ARM_POSE.keys())
 
 
-# Curriculum start pose: hands approximately at the box side-face pinch target.
-# Shoulder pitch more negative → arms lower; elbow bent → wrist forward-inward;
-# shoulder roll ±0.20 → hands open sideways to reach the box y=±0.13 faces.
-# Not exact IK — best-effort heuristic. PPO refines from here toward the true
-# pinch geometry defined by _desired_grasp_pos_w.
-PINCH_ARM_POSE = {
-    "left_shoulder_pitch_joint":  -1.20,
+# Curriculum start pose: arms on a diagonal pointing forward-down toward the
+# box. G1 shoulder_pitch convention: 0 = arm hanging straight down, -pi/2 =
+# arm horizontal forward. So LESS negative pitch = arm closer to hanging =
+# hand LOWER. READY at -0.85 puts hand at z=0.79; PINCH at -0.60 puts hand
+# lower (closer to box at z=0.60). Shoulder roll opens the hands sideways
+# for the box y=+/-0.13 side-face targets. Elbow kept small so the forearm
+# extends the shoulder direction rather than folding back up.
+PINCH_POSE = {
+    # Upper arms angled forward-up (like carry hugging pose) so the shoulders
+    # sit higher and the arms wrap around the box from above; elbow flexion
+    # then drops the forearm down onto the box side faces for the pinch.
+    "left_shoulder_pitch_joint":  -1.00,
     "left_shoulder_roll_joint":    0.20,
     "left_shoulder_yaw_joint":     0.0,
-    "left_elbow_joint":            0.90,
+    "left_elbow_joint":            1.40,
     "left_wrist_roll_joint":       0.0,
     "left_wrist_pitch_joint":      0.0,
     "left_wrist_yaw_joint":        0.0,
-    "right_shoulder_pitch_joint": -1.20,
+    "right_shoulder_pitch_joint": -1.00,
     "right_shoulder_roll_joint":  -0.20,
     "right_shoulder_yaw_joint":    0.0,
-    "right_elbow_joint":           0.90,
+    "right_elbow_joint":           1.40,
     "right_wrist_roll_joint":      0.0,
     "right_wrist_pitch_joint":     0.0,
     "right_wrist_yaw_joint":       0.0,
+    # Torso leans forward + legs bend to keep CoM over the feet. Without the
+    # hip/knee/ankle compensation, the 23-degree torso lean tips the robot
+    # forward on tick 0 and every episode dies before the policy can react
+    # (the ~1000-iter ep_length stall observed empirically).
+    "waist_pitch_joint":           0.40,
+    "left_hip_pitch_joint":        0.30,
+    "left_knee_joint":             0.30,
+    "left_ankle_pitch_joint":     -0.15,
+    "right_hip_pitch_joint":       0.30,
+    "right_knee_joint":            0.30,
+    "right_ankle_pitch_joint":    -0.15,
 }
-assert set(PINCH_ARM_POSE.keys()) == set(READY_ARM_POSE.keys()), "PINCH / READY joint sets must match"
+PINCH_JOINTS = tuple(PINCH_POSE.keys())
 
 
 # Scene and task geometry.
@@ -151,16 +144,17 @@ CHEST_Z          = 0.93
 
 
 # 20-D per-reset command: grasp offsets, object spawn pose, lift target (yaw-only quats).
-GRASP_NOMINAL_Y   = 0.13   # left-hand nominal y in box frame (right mirrors)
+GRASP_NOMINAL_Y   = 0.14   # left-wrist target on box side face (box_half=0.105 + wrist sphere radius 0.035); right mirrors
 GRASP_NOMINAL_Z   = 0.02
 GRASP_JITTER      = 0.03
 
-# Box always spawns on the table with zero velocity + tight domain randomization:
-# ±5 cm in each xy direction, ±20° in yaw. Discovered that wider jitter (±10-15 cm)
-# combined with hand_bias > 0 was letting the policy "catch the falling box" instead
-# of picking it from the table.
+# Box always spawns on the table with zero velocity + tight domain randomization.
+# X jitter kept at 5 cm; Y jitter reduced to 1 cm so the wrist pinch target
+# (fixed at world y = +/- 0.14 via the reset pose) reliably lands on the box
+# side face regardless of the jitter draw. Wider Y jitter used to leave the
+# wrists either 5 cm inside or 5 cm outside the wall on any given episode.
 OBJECT_XY_JITTER_X = 0.05
-OBJECT_XY_JITTER_Y = 0.05
+OBJECT_XY_JITTER_Y = 0.01
 OBJECT_YAW_RANGE   = math.radians(20.0)
 
 LIFT_X_CENTER   = 0.30
@@ -263,7 +257,10 @@ def _get_box_spec() -> mujoco.MjSpec:
         rgba=(0.85, 0.22, 0.18, 1.0),
         condim=6,
         friction=(4.0, 0.25, 0.08),
-        solref=(0.004, 1.0),
+        # solref[0] must be >= 2 * timestep for MuJoCo stability. With
+        # dt=0.005 the previous 0.004 was below the rule, causing the box
+        # to sink slightly into the table each step. 0.02 is safely above.
+        solref=(0.02, 1.0),
         solimp=(0.95, 0.995, 0.001, 0.5, 2.0),
     )
     return spec
@@ -376,13 +373,16 @@ def reset_arms_to_ready(
     asset_cfg: SceneEntityCfg,
     pinch_bias: float = 0.0,
 ) -> None:
-    """Snap the 14 arm joints to a blend of PINCH_ARM_POSE and READY_ARM_POSE.
-    pinch_bias=1.0 → PINCH (hands close to grasp target, curriculum start).
-    pinch_bias=0.0 → READY (hands forward-down above box, curriculum end).
-    Linear interpolation between the two.
-    Args: env — RL env; env_ids — envs to reset (None = all); asset_cfg — robot entity selecting the 14 arm joints; pinch_bias — blend in [0, 1], ramped by pick_curriculum.
+    """Blend the joints in PINCH_POSE from the current walk-buffer state toward PINCH.
+    pinch_bias=1.0 → snap to PINCH_POSE (arms + torso + hip/knee compensation).
+    pinch_bias=0.0 → no-op: the walk-buffer reset that just ran wins.
+    Blend: (1-bias) * current + bias * PINCH_target.
+    Args: env — RL env; env_ids — envs to reset (None = all); asset_cfg — robot entity with joint_names=PINCH_JOINTS; pinch_bias — blend in [0, 1], ramped by pick_curriculum.
     Returns: none.
     """
+    pb = float(max(0.0, min(1.0, pinch_bias)))
+    if pb <= 0.0:
+        return
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
     n = len(env_ids)
@@ -394,11 +394,12 @@ def reset_arms_to_ready(
         joint_ids_t = torch.tensor(joint_ids, device=env.device)
     else:
         joint_ids_t = joint_ids
-    pb = float(max(0.0, min(1.0, pinch_bias)))
-    pose = torch.tensor(
-        [pb * PINCH_ARM_POSE[j] + (1.0 - pb) * READY_ARM_POSE[j] for j in asset_cfg.joint_names],
+    current = asset.data.joint_pos[env_ids][:, joint_ids_t]
+    pinch_target = torch.tensor(
+        [PINCH_POSE[j] for j in asset_cfg.joint_names],
         device=env.device,
-    ).unsqueeze(0).expand(n, -1).clone()
+    ).unsqueeze(0).expand(n, -1)
+    pose = ((1.0 - pb) * current + pb * pinch_target).clone()
     vel = torch.zeros_like(pose)
     asset.write_joint_state_to_sim(pose, vel, joint_ids=joint_ids_t, env_ids=env_ids)
 
@@ -593,6 +594,48 @@ def both_hands_hit_bonus(env, left_hand_cfg, right_hand_cfg, box_cfg, threshold:
     dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
     dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
     return ((dl < threshold) & (dr < threshold)).float()
+
+
+# Dense-monotonic reward triplet copying walk/carry's shape: ungated Gaussian
+# kernels over a single error dim, always positive, always paying gradient.
+# Provide the "there's something to optimize on tick 0" signal that the gated
+# bundle rewards (hand_placement, stability, lift) can't produce until the
+# robot already stands and reaches. Small weights so they shape the local
+# optimum without overshadowing the true task rewards once training rolls.
+def hand_to_grasp_target_dense(env, left_hand_cfg, right_hand_cfg, box_cfg, std: float = 0.25):
+    """Ungated Gaussian on each hand's distance to its commanded grasp point.
+    Args: env — RL env; left/right_hand_cfg — hand entity selectors; box_cfg — box entity; std — kernel width in meters (0.25 pays partial reward from ~40 cm out).
+    Returns: (num_envs,) tensor in [0, 2] (sum of two per-hand Gaussians).
+    """
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    return torch.exp(-0.5 * (dl / std) ** 2) + torch.exp(-0.5 * (dr / std) ** 2)
+
+
+def upright_dense(env, trunk_cfg, std: float = 0.45):
+    """Ungated Gaussian on torso tilt: 1 when perfectly upright, decays smoothly.
+    Args: env — RL env; trunk_cfg — trunk body selector; std — kernel width on (1 - up_z).
+    Returns: (num_envs,) tensor in [0, 1]. Same shape as walk's mdp.upright.
+    """
+    entity: Entity = env.scene[trunk_cfg.name]
+    if trunk_cfg.body_ids is not None:
+        quat = entity.data.body_link_quat_w[:, trunk_cfg.body_ids].squeeze(1)
+    else:
+        quat = entity.data.root_link_quat_w
+    qx, qy = quat[:, 1], quat[:, 2]
+    up_z = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return torch.exp(-0.5 * ((1.0 - up_z) / std) ** 2)
+
+
+def hand_pinch_progress(env, left_hand_cfg, right_hand_cfg, box_cfg, std: float = 0.05):
+    """Smooth "both hands near pinch target" — Gaussian replacement for the binary hit_bonus.
+    Product of two 5 cm Gaussians so it saturates at 1 only when BOTH hands are on target.
+    Args: env — RL env; left/right_hand_cfg — hand entity selectors; box_cfg — box entity; std — per-hand kernel width in meters.
+    Returns: (num_envs,) tensor in [0, 1].
+    """
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    return torch.exp(-0.5 * (dl / std) ** 2) * torch.exp(-0.5 * (dr / std) ** 2)
 
 
 def palm_inward_reward(env, hand_cfg, palm_axis_local, target_axis_body):
@@ -1434,25 +1477,27 @@ def reset_from_walk_buffer(
 
 # Curriculum.
 def pick_curriculum(env, env_ids):
-    """Widen the reset-base jitter, object DR jitter, and unwind the pinch-arm bias.
-    pinch_bias starts at 1.0 (hands already pinching the box) so the policy first
-    sees a solved-grip state, then ramps to 0.0 (raw READY_ARM_POSE) so it must
-    learn the reach+grip end-to-end. Timing mirrors the scale ramp: constant
-    pinch=1 during scale=0.30, linear ramp during the scale bump, constant
-    pinch=0 once the environment is at full difficulty.
+    """Widen the reset-base jitter, object DR jitter, and unwind the pinch bias.
+    pinch_bias starts at 1.0 (robot spawns already pinching the box) and ramps
+    to 0.0 by ~iteration 500, after which the reset comes straight from the
+    walk-buffer snapshot with no PINCH override. Thresholds picked assuming
+    ~200k env-steps per iteration (NUM_ENVS=8192, rollout=24). Timing:
+      * iters   0-100 (step < 20M):   scale=0.30, pinch_bias=1.0
+      * iters 100-500 (step 20M-100M): scale ramps 0.30 -> 0.65, pinch 1.0 -> 0.0
+      * iters   > 500 (step > 100M):  scale ramps to 1.0 by 150M, pinch=0.0
     Args: env — the RL env; env_ids — envs being updated (unused, curriculum is global).
     Returns: dict with pick_scale and pick_pinch_bias for logging.
     """
     step = int(getattr(env, "common_step_counter", 0))
-    if step < 2_000_000:
+    if step < 20_000_000:
         scale = 0.30
         pinch_bias = 1.0
-    elif step < 4_000_000:
-        t = (step - 2_000_000) / (4_000_000 - 2_000_000)
+    elif step < 100_000_000:
+        t = (step - 20_000_000) / (100_000_000 - 20_000_000)
         scale = 0.30 + 0.35 * t
         pinch_bias = 1.0 - t
-    elif step < 6_000_000:
-        scale = 0.65
+    elif step < 150_000_000:
+        scale = 0.65 + 0.35 * (step - 100_000_000) / (150_000_000 - 100_000_000)
         pinch_bias = 0.0
     else:
         scale = 1.00
@@ -1500,7 +1545,7 @@ def build_g1_pick_mdp():
     )
 
     g1_asset    = SceneEntityCfg("robot", joint_names=G1_JOINTS, preserve_order=True)
-    arm_asset   = SceneEntityCfg("robot", joint_names=READY_ARM_JOINTS, preserve_order=True)
+    arm_asset   = SceneEntityCfg("robot", joint_names=PINCH_JOINTS, preserve_order=True)
     left_sym    = SceneEntityCfg("robot", joint_names=_LEFT_SYM_JOINTS,  preserve_order=True)
     right_sym   = SceneEntityCfg("robot", joint_names=_RIGHT_SYM_JOINTS, preserve_order=True)
     wrist_acts  = SceneEntityCfg("robot", actuator_names=(r".*wrist.*",), preserve_order=True)
@@ -1630,6 +1675,25 @@ def build_g1_pick_mdp():
 
     # Task rewards gated on upright torso (≤25°) AND both feet in contact; palm-inward stays ungated.
     rewards = {
+        # DENSE-MONOTONIC TRIPLET (ungated, always paying since tick 0). These
+        # copy walk/carry's reward shape (small Gaussian per single-dim error)
+        # so PPO has a non-zero gradient before the robot ever stands or reaches.
+        # Weights kept modest so the actual bundle rewards below dominate once
+        # the policy graduates from "just don't fall".
+        "hand_to_grasp_dense": RewardTermCfg(
+            func=hand_to_grasp_target_dense, weight=1.5,
+            params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "box_cfg": box, "std": 0.25},
+        ),
+        "upright_dense": RewardTermCfg(
+            func=upright_dense, weight=1.0,
+            params={"trunk_cfg": trunk, "std": 0.45},
+        ),
+        "hand_pinch_progress": RewardTermCfg(
+            func=hand_pinch_progress, weight=2.0,
+            params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "box_cfg": box, "std": 0.05},
+        ),
         # Fused: reach_left + reach_right + hit_bonus + hold_box → hand_placement_bundle.
         # All 4 shared the same stability_gate and the same (dl, dr) hand-to-anchor
         # distances; distances now computed once. Weights folded in.
@@ -1690,7 +1754,7 @@ def build_g1_pick_mdp():
         # early sparse-grasp phase so the policy first learns "don't die",
         # then "reach and grip". Weight small so it doesn't drown out the
         # grasp / lift rewards once those start firing.
-        "alive_bonus":    RewardTermCfg(func=alive_bonus, weight=0.5, params={}),
+        "alive_bonus":    RewardTermCfg(func=alive_bonus, weight=1.5, params={}),
         # Weight -0.5 -> -2.0: at -0.5 the penalty was negligible during the
         # hold phase (~0.1-0.5 units of motion × 0.5 ≈ trivial vs +30 stability
         # + +5 grip_force), so the policy jittered its arms freely while
@@ -2080,7 +2144,7 @@ def g1_pick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             nconmax=200,
             njmax=800,
             contact_sensor_maxmatch=500,
-            mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=30),
+            mujoco=MujocoCfg(timestep=0.005, iterations=20, ls_iterations=30),
         ),
         decimation=5,
         episode_length_s=3.25,
