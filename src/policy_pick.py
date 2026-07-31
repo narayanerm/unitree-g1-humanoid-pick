@@ -621,6 +621,16 @@ def upright_dense(env, trunk_cfg, std: float = 0.45):
     return torch.exp(-0.5 * ((1.0 - up_z) / std) ** 2)
 
 
+def base_stay_still_reward(env, std: float = 0.30):
+    """Ungated Gaussian on base linear-xy speed with target = 0 (walk-style "track zero vel").
+    Args: env — RL env; std — kernel width in m/s (0.30 saturates quickly for a stationary task).
+    Returns: (num_envs,) tensor in (0, 1]. High when the base is planted, decays as it drifts.
+    """
+    v_xy = env.scene["robot"].data.root_link_lin_vel_w[:, :2]
+    speed = torch.linalg.norm(v_xy, dim=-1)
+    return torch.exp(-0.5 * (speed / std) ** 2)
+
+
 def hand_pinch_progress(env, left_hand_cfg, right_hand_cfg, box_cfg, std: float = 0.05):
     """Smooth "both hands near pinch target" — Gaussian replacement for the binary hit_bonus.
     Product of two 5 cm Gaussians so it saturates at 1 only when BOTH hands are on target.
@@ -1681,9 +1691,22 @@ def build_g1_pick_mdp():
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "box_cfg": box, "std": 0.25},
         ),
+        # Measured on the pelvis (not the torso): waist_pitch = 0.40 in PINCH
+        # deliberately leans the torso forward for reach, so an upright reward
+        # on the torso created a "walk on tiptoes to tilt the whole body back
+        # and cancel the torso lean" gaming loop. Pelvis is downstream of the
+        # legs but upstream of the waist joint, so "pelvis upright" means
+        # "legs standing", which is what we actually want.
         "upright_dense": RewardTermCfg(
-            func=upright_dense, weight=1.0,
-            params={"trunk_cfg": trunk, "std": 0.45},
+            func=upright_dense, weight=3.0,
+            params={"trunk_cfg": pelvis, "std": 0.45},
+        ),
+        # Walk-style "track zero velocity" for the base: dense monotonic
+        # Gaussian that pays for staying planted. Fills the gap that walk's
+        # track_linear_velocity fills for locomotion policies.
+        "base_stay_still": RewardTermCfg(
+            func=base_stay_still_reward, weight=1.5,
+            params={"std": 0.30},
         ),
         "hand_pinch_progress": RewardTermCfg(
             func=hand_pinch_progress, weight=2.0,
