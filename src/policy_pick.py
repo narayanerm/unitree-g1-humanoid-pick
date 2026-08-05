@@ -381,9 +381,10 @@ def reset_pick_command_and_object(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     scale: float = 1.0,
+    hand_bias: float = 0.0,
 ) -> None:
-    """Sample the 20-D command and write the box spawn on the table.
-    Args: env — the RL env; env_ids — envs to reset (all if None); scale — curriculum range multiplier in [0, 1] applied to xy/yaw jitter.
+    """Sample the 20-D command and write the box spawn so they match.
+    Args: env — the RL env; env_ids — envs to reset (all if None); scale — curriculum range multiplier in [0, 1] applied to xy/yaw jitter; hand_bias — curriculum interpolation in [0, 1] between "box on table" (0) and "box already in hands at chest" (1). Set to 1.0 early in training so the policy discovers the lift phase before having to reach; ramped to 0 by pick_curriculum.
     Returns: none.
     """
     from mjlab.utils.lab_api.math import sample_uniform, quat_from_euler_xyz
@@ -399,16 +400,22 @@ def reset_pick_command_and_object(
     origins = env.scene.env_origins[env_ids]
     zero = torch.zeros(n, device=device)
 
-    # Box always spawns at rest on the table (no "in hands" branch): removed the
-    # hand_bias interpolation because the policy was learning to catch the box
-    # mid-fall instead of picking it up from the surface.
+    # Box spawn: interpolate between table position (default) and "in hands"
+    # (chest height, close to the robot spawn) based on hand_bias. Jitter
+    # only applies to the table component so the "in hands" pose is stable.
     ox = sample_uniform(-OBJECT_XY_JITTER_X * scale, OBJECT_XY_JITTER_X * scale, (n,), device=device)
     oy = sample_uniform(-OBJECT_XY_JITTER_Y * scale, OBJECT_XY_JITTER_Y * scale, (n,), device=device)
     o_yaw = sample_uniform(-OBJECT_YAW_RANGE * scale, OBJECT_YAW_RANGE * scale, (n,), device=device)
+    table_x = BOX_START_X + ox
+    table_z = torch.full((n,), BOX_START_Z, device=device)
+    # "In hands" target: right at the estimated READY_ARM_POSE hand position.
+    hands_x = torch.full((n,), 0.46, device=device)
+    hands_z = torch.full((n,), 0.79, device=device)
+    hb = float(max(0.0, min(1.0, hand_bias)))
     obj_pos_w = torch.stack([
-        origins[:, 0] + BOX_START_X + ox,
-        origins[:, 1] + oy,
-        origins[:, 2] + BOX_START_Z,
+        origins[:, 0] + (1.0 - hb) * table_x + hb * hands_x,
+        origins[:, 1] + (1.0 - hb) * oy,
+        origins[:, 2] + (1.0 - hb) * table_z + hb * hands_z,
     ], dim=-1)
     obj_quat_w = quat_from_euler_xyz(zero, zero, o_yaw)
 
@@ -1207,13 +1214,23 @@ _WALK_BUFFER_CACHE: dict[str, torch.Tensor] | None = None
 
 
 def _load_walk_buffer(path: str, device: torch.device,
-                      min_upright: float = 0.90) -> dict[str, torch.Tensor]:
-    """Load the .npz walk-terminal buffer once and cache tensors on device.
-    Filters entries to keep only "stable" snapshots: trunk upright (up_z from
-    quat_zy >= min_upright, i.e. ~<25° tilt). This drops the mid-walk
-    catastrophic entries that used to catapult the pick reset into a 9-step
-    fall. Filter is applied once at load time and cached.
-    Args: path — path to the .npz buffer; device — torch device; min_upright — minimum quat-derived up_z to keep an entry (0.90 ≈ 25° tilt).
+                      min_upright: float   = 0.98,
+                      root_z_range: tuple[float, float] = (0.72, 0.78),
+                      max_lin_vel: float   = 0.40,
+                      max_ang_vel: float   = 0.60,
+                      max_joint_vel: float = 4.00) -> dict[str, torch.Tensor]:
+    """Load and filter the .npz walk-terminal buffer to keep only near-static entries.
+    Filter (all conditions must hold) drops mid-cycle snapshots where a foot is up
+    or the robot is mid-stride, keeps only frames where the walk policy happened
+    to be transitioning through a quasi-static pose:
+      * trunk upright: up_z from quat_zy >= min_upright (~<18° tilt at 0.95)
+      * root height inside range (default 0.72-0.78 m, brackets the G1 standing height)
+      * base linear velocity magnitude <= max_lin_vel
+      * base angular velocity magnitude <= max_ang_vel
+      * max |joint velocity| across joints <= max_joint_vel
+    If the filter leaves fewer than 1024 or n_before/20 entries, falls back to
+    unfiltered (avoids resample lockup).
+    Args: path — buffer file; device — torch device; min_upright/root_z_range/max_lin_vel/max_ang_vel/max_joint_vel — filter thresholds (see above).
     Returns: dict of buffer name to tensor (plus a "_path" sentinel).
     """
     global _WALK_BUFFER_CACHE
@@ -1228,18 +1245,34 @@ def _load_walk_buffer(path: str, device: torch.device,
             )
         arr = _np.load(p)
         cache = {k: torch.from_numpy(arr[k]).float().to(device) for k in arr.files}
-        # Filter: keep only entries where the trunk is roughly upright.
-        # quat_zy is stored as (w, x, y, z); up_z = 1 - 2*(x^2 + y^2).
+
+        # quat_zy = (w, x, y, z); up_z = 1 - 2*(x^2 + y^2) (yaw already stripped).
         q = cache["quat_zy"]
         x, y = q[:, 1], q[:, 2]
         up_z = 1.0 - 2.0 * (x * x + y * y)
-        keep = up_z >= min_upright
+        root_z = cache["root_z"].squeeze(-1)
+        lin_vel_norm = cache["lin_vel_by"].norm(dim=-1)
+        ang_vel_norm = cache["ang_vel_by"].norm(dim=-1)
+        joint_vel_max = cache["joint_vel"].abs().max(dim=-1).values
+
+        keep = (
+            (up_z >= min_upright)
+            & (root_z >= root_z_range[0]) & (root_z <= root_z_range[1])
+            & (lin_vel_norm <= max_lin_vel)
+            & (ang_vel_norm <= max_ang_vel)
+            & (joint_vel_max <= max_joint_vel)
+        )
         n_before = q.shape[0]
         n_after  = int(keep.sum().item())
+        print(f"[walk_buffer filter] kept {n_after}/{n_before} entries "
+              f"({100.0 * n_after / n_before:.1f}%)")
+
         if n_after < max(1024, n_before // 20):
-            # Filter left too little — fall back to unfiltered (avoids resample lock).
+            print(f"[walk_buffer filter] fell below fallback threshold "
+                  f"(max(1024, n/20) = {max(1024, n_before // 20)}) - using unfiltered buffer instead.")
             keep = torch.ones_like(keep)
             n_after = n_before
+
         for k in list(cache.keys()):
             if isinstance(cache[k], torch.Tensor) and cache[k].shape[0] == n_before:
                 cache[k] = cache[k][keep].contiguous()
@@ -1377,20 +1410,26 @@ def reset_from_walk_buffer(
 
 # Curriculum.
 def pick_curriculum(env, env_ids):
-    """Widen the reset-base jitter and object DR jitter across training stages.
+    """Widen the reset-base jitter, command ranges, and shift the box from
+    in-hands to on-table across training stages.
     Args: env — the RL env; env_ids — envs being updated (unused, curriculum is global).
-    Returns: dict with the current pick_scale for logging.
+    Returns: dict with the current pick_scale and hand_bias for logging.
     """
     step = int(getattr(env, "common_step_counter", 0))
     if step < 2_000_000:
         scale = 0.30
+        hand_bias = 1.0                    # box spawns in the hands — grasp is trivial, learn to lift
     elif step < 4_000_000:
+        # Ease box onto the table over this window.
         t = (step - 2_000_000) / (4_000_000 - 2_000_000)
         scale = 0.30 + 0.35 * t
+        hand_bias = 1.0 - t
     elif step < 6_000_000:
         scale = 0.65
+        hand_bias = 0.0                    # box on table, full pick task
     else:
         scale = 1.00
+        hand_bias = 0.0
     xy_range  = (-0.12 * scale, 0.12 * scale)
     yaw_range = (-0.30 * scale, 0.30 * scale)
     try:
@@ -1401,10 +1440,11 @@ def pick_curriculum(env, env_ids):
         pass
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_pick_cmd")
-        term_cfg.params["scale"] = scale
+        term_cfg.params["scale"]     = scale
+        term_cfg.params["hand_bias"] = hand_bias
     except Exception:
         pass
-    return {"pick_scale": scale}
+    return {"pick_scale": scale, "pick_hand_bias": hand_bias}
 
 
 # MDP assembly.
@@ -1716,7 +1756,7 @@ def build_g1_pick_mdp():
         "reset_pick_cmd": EventTermCfg(
             func=reset_pick_command_and_object,
             mode="reset",
-            params={"scale": 0.30},   # overwritten by pick_curriculum
+            params={"scale": 0.30, "hand_bias": 1.0},   # both overwritten by pick_curriculum
         ),
         "push_robot": EventTermCfg(
             func=vel_mdp.push_by_setting_velocity,
