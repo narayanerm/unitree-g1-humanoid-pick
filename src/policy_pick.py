@@ -110,6 +110,33 @@ READY_ARM_POSE = {
 READY_ARM_JOINTS = tuple(READY_ARM_POSE.keys())
 
 
+# Target arm pose for the terminal (hold-at-chest) phase. Mirrors the
+# HOLDING_ARM_POSE from policy_carry so pick's terminal snapshot matches the
+# posture carry expects at reset: shoulders slightly less pitched-down, elbows
+# more flexed, rolls opened outward (chest-hug). Same joint order as
+# READY_ARM_JOINTS so arm_asset can index either.
+HOLDING_ARM_POSE = {
+    "left_shoulder_pitch_joint":  -0.70,
+    "left_shoulder_roll_joint":    0.20,
+    "left_shoulder_yaw_joint":     0.0,
+    "left_elbow_joint":            0.60,
+    "left_wrist_roll_joint":       0.0,
+    "left_wrist_pitch_joint":      0.0,
+    "left_wrist_yaw_joint":        0.0,
+    "right_shoulder_pitch_joint": -0.70,
+    "right_shoulder_roll_joint":  -0.20,
+    "right_shoulder_yaw_joint":    0.0,
+    "right_elbow_joint":           0.60,
+    "right_wrist_roll_joint":      0.0,
+    "right_wrist_pitch_joint":     0.0,
+    "right_wrist_yaw_joint":       0.0,
+}
+assert tuple(HOLDING_ARM_POSE.keys()) == READY_ARM_JOINTS, (
+    "HOLDING_ARM_POSE must share joint order with READY_ARM_POSE so arm_asset indexes both."
+)
+HOLDING_ARM_TARGET = tuple(HOLDING_ARM_POSE[j] for j in READY_ARM_JOINTS)
+
+
 # Scene and task geometry.
 TABLE_X          = 0.60
 TABLE_HEIGHT     = 0.44
@@ -880,6 +907,40 @@ def hand_placement_bundle_reward(
     return (w_reach * reach + w_hit * hit + w_hold * hold) * gate
 
 
+def arm_pose_carry_ready_reward(
+    env, box_cfg, left_hand_cfg, right_hand_cfg, arm_cfg,
+    target_values: tuple[float, ...] = HOLDING_ARM_TARGET,
+    sigma: float = 0.30,
+    lift_threshold: float = 0.15,
+    hold_dist: float = 0.15,
+):
+    """Shape the terminal arm pose toward HOLDING_ARM_POSE (carry-ready).
+
+    Gaussian on the mean per-joint distance from the 14 arm joints to
+    HOLDING_ARM_TARGET, gated on (box lifted) AND (both hands near their
+    commanded grasp anchors). The double gate keeps the term silent during
+    reach/lift — it only fires once the robot is actually holding the box up,
+    so it molds the terminal posture without distorting the pick trajectory.
+
+    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities for the hold gate; arm_cfg — SceneEntityCfg selecting the 14 arm joints in HOLDING_ARM_JOINTS order; target_values — per-joint targets aligned with arm_cfg.joint_ids; sigma — Gaussian bandwidth (rad) on the RMS joint error; lift_threshold — min box clearance above tabletop; hold_dist — max hand-to-anchor distance for the hold gate.
+    Returns: (num_envs,) tensor in [0, 1].
+    """
+    box_z = _entity_pos(env, box_cfg)[:, 2]
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    gate = ((box_z > TABLE_TOP_Z + lift_threshold) & (dl < hold_dist) & (dr < hold_dist)).float()
+
+    robot = env.scene["robot"]
+    joints = robot.data.joint_pos[:, arm_cfg.joint_ids]
+    if not hasattr(env, "_holding_arm_target_cache"):
+        env._holding_arm_target_cache = torch.tensor(
+            target_values, device=env.device, dtype=joints.dtype,
+        )
+    err = joints - env._holding_arm_target_cache
+    mean_sq_err = (err * err).mean(dim=-1)
+    return gate * torch.exp(-mean_sq_err / (2.0 * sigma * sigma))
+
+
 def box_at_lift_target_pos_reward(
     env, box_cfg,
     sigma_xy: float = 0.30,
@@ -1352,18 +1413,16 @@ def pick_curriculum(env, env_ids):
     Returns: dict with the current pick_scale and hand_bias for logging.
     """
     step = int(getattr(env, "common_step_counter", 0))
-    if step < 2_000_000:
+    # Schedule anchored to PPO iters (num_steps_per_env=24): iter 500 = 12k, iter 3000 = 72k.
+    # Short warmup at hand_bias=1.0, quick ramp, then full box-on-table from iter 3k onwards.
+    if step < 12_000:                      # iter 0-500: brief warmup
         scale = 0.30
         hand_bias = 1.0                    # box spawns in the hands — grasp is trivial, learn to lift
-    elif step < 4_000_000:
-        # Ease box onto the table over this window.
-        t = (step - 2_000_000) / (4_000_000 - 2_000_000)
-        scale = 0.30 + 0.35 * t
+    elif step < 72_000:                    # iter 500-3000: ramp
+        t = (step - 12_000) / (72_000 - 12_000)
+        scale = 0.30 + 0.70 * t
         hand_bias = 1.0 - t
-    elif step < 6_000_000:
-        scale = 0.65
-        hand_bias = 0.0                    # box on table, full pick task
-    else:
+    else:                                  # iter 3000+: full pick task
         scale = 1.00
         hand_bias = 0.0
     xy_range  = (-0.12 * scale, 0.12 * scale)
@@ -1587,6 +1646,17 @@ def build_g1_pick_mdp():
         "box_carry_pose": RewardTermCfg(
             func=box_carry_pose_bundle_reward, weight=1.0,
             params={"box_cfg": box, "w_upright": 1.5, "w_front": 1.5, "w_chest": 1.5},
+        ),
+        # Shapes the terminal arm posture toward HOLDING_ARM_POSE (carry-ready
+        # chest-hug) so the pick's terminal snapshot feeds cleanly into carry's
+        # reset_from_pick_buffer. Double-gated on (box lifted) AND (both hands
+        # near anchors) so it stays silent during reach/lift.
+        "arm_pose_carry_ready": RewardTermCfg(
+            func=arm_pose_carry_ready_reward, weight=1.5,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "arm_cfg": arm_asset,
+                    "target_values": HOLDING_ARM_TARGET,
+                    "sigma": 0.30, "lift_threshold": 0.15, "hold_dist": 0.15},
         ),
         # Linear progress on box height above the table, gated on holding.
         # Complements the Gaussian above with a dense monotonic signal so
