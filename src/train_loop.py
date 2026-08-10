@@ -212,6 +212,7 @@ def run(
     log_dir: Path,
     warm_start_ckpt: Optional[str | Path] = None,
     resume_ckpt: Optional[str | Path] = None,
+    reset_std: Optional[float] = None,
     early_stopping: bool = False,
     patience: int = 200,
     window: int = 50,
@@ -220,7 +221,7 @@ def run(
     diagnostic_trunk_frozen: bool = False,
 ) -> None:
     """Entrypoint for PPO training with warm-start, resume, progressive unfreeze, and diagnostic modes.
-    Args: task_id — mjlab task id; cfg — TrainConfig (env, agent, ...); log_dir — output dir; warm_start_ckpt — optional shape-filtered source ckpt; resume_ckpt — optional identical-shape resume ckpt (exclusive with warm_start_ckpt); early_stopping/patience/window/min_improve — plateau-stop controls; critic_warmup_iters — legacy freeze-actor duration (0 uses progressive unfreeze); diagnostic_trunk_frozen — freeze mlp.2/mlp.4 and swap head (requires warm_start_ckpt).
+    Args: task_id — mjlab task id; cfg — TrainConfig (env, agent, ...); log_dir — output dir; warm_start_ckpt — optional shape-filtered source ckpt; resume_ckpt — optional identical-shape resume ckpt (exclusive with warm_start_ckpt); reset_std — after resume, force the actor's Gaussian std to this scalar (typical: 1.0 to recover a stalled/blown-up std); early_stopping/patience/window/min_improve — plateau-stop controls; critic_warmup_iters — legacy freeze-actor duration (0 uses progressive unfreeze); diagnostic_trunk_frozen — freeze mlp.2/mlp.4 and swap head (requires warm_start_ckpt).
     Returns: none.
     """
     from mjlab.envs import ManagerBasedRlEnv
@@ -250,9 +251,28 @@ def run(
     if resume_ckpt is not None:
         print(f"[INFO] Resuming from: {resume_ckpt}")
         runner.load(str(resume_ckpt))
+        if reset_std is not None:
+            # Adaptive KL can inflate the Gaussian std when reward plateaus; forcing a
+            # smaller std on resume lets the actor re-explore without a runaway noise level.
+            dist = runner.alg.actor.distribution
+            with torch.no_grad():
+                if hasattr(dist, "std_param"):
+                    dist.std_param.fill_(float(reset_std))
+                    new_mean = float(dist.std_param.mean().item())
+                elif hasattr(dist, "log_std_param"):
+                    import math
+                    dist.log_std_param.fill_(math.log(float(reset_std)))
+                    new_mean = float(dist.log_std_param.exp().mean().item())
+                else:
+                    raise AttributeError(
+                        "Actor distribution has no std_param/log_std_param — cannot reset std."
+                    )
+            print(f"[INFO] Reset policy std to {reset_std:.3f} (verified mean std={new_mean:.3f}).")
     elif warm_start_ckpt is not None:
         print(f"[INFO] Warm-start from: {warm_start_ckpt}")
         warm_start_shape_filtered(runner, warm_start_ckpt)
+    elif reset_std is not None:
+        print("[WARN] reset_std ignored: only takes effect together with resume_ckpt.")
 
     if critic_warmup_iters is None:
         critic_warmup_iters = 0
