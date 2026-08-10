@@ -1412,7 +1412,16 @@ def pick_curriculum(env, env_ids):
     Args: env — the RL env; env_ids — envs being updated (unused, curriculum is global).
     Returns: dict with the current pick_scale and hand_bias for logging.
     """
-    step = int(getattr(env, "common_step_counter", 0))
+    # Runner-owned counter (increments per call) instead of env.common_step_counter, which
+    # persists across runner.load() and made the curriculum skip past the ramp on resume —
+    # the box was on the table from step 0 of a resume, but the loaded actor had only
+    # trained hand_bias=1.0 and closed hands aggressively in the air, tipping the robot
+    # in <10 steps. A per-env counter is 0 at every fresh runner (each run_train_loop
+    # instantiates a new env), so the ramp always plays out from scratch on resume.
+    if not hasattr(env, "_pick_curriculum_step"):
+        env._pick_curriculum_step = 0
+    env._pick_curriculum_step += 1
+    step = env._pick_curriculum_step
     # Schedule anchored to PPO iters (num_steps_per_env=24): iter 500 = 12k, iter 3000 = 72k.
     # Short warmup at hand_bias=1.0, quick ramp, then full box-on-table from iter 3k onwards.
     if step < 12_000:                      # iter 0-500: brief warmup
