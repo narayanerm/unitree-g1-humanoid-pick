@@ -247,19 +247,6 @@ def run(
     runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
     runner = runner_cls(env, agent_cfg, str(log_dir), device)
 
-    # Optional PPO mirror data augmentation: if the task's policy module defines
-    # SYMMETRY_CFG, wire it into runner.alg.symmetry. Skipped silently otherwise.
-    try:
-        from src import policy_pick as _pick_mod
-        if hasattr(_pick_mod, "SYMMETRY_CFG"):
-            runner.alg.symmetry = dict(_pick_mod.SYMMETRY_CFG)
-            runner.alg.symmetry["_env"] = env
-            print(f"[symmetry] enabled: use_data_augmentation="
-                  f"{runner.alg.symmetry['use_data_augmentation']}, "
-                  f"use_mirror_loss={runner.alg.symmetry['use_mirror_loss']}")
-    except ImportError:
-        pass
-
     if resume_ckpt is not None:
         print(f"[INFO] Resuming from: {resume_ckpt}")
         runner.load(str(resume_ckpt))

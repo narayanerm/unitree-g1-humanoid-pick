@@ -172,24 +172,6 @@ _RIGHT_SYM_JOINTS = tuple(p[1] for p in _SYMMETRIC_PAIRS)
 _SYM_SIGNS        = tuple(float(p[2]) for p in _SYMMETRIC_PAIRS)
 
 
-# Full 29-joint mirror map for PPO data augmentation.
-# Format: for i in [0, 29), _JOINT_MIRROR_MAP[i] = (j, sign) such that
-# mirrored_joint[i] = sign * original_joint[j] under a sagittal-plane mirror
-# (world y=0, robot yaw ≈ 0 — valid for pick since the robot faces the table
-# along +x for the whole episode).
-# Sign convention matches _SYMMETRIC_PAIRS: pitch/knee/elbow = +1; roll = -1;
-# yaw = +1 for arm/hip joints (G1's per-joint frame absorbs the mirror), -1
-# for the centerline waist_yaw and waist_roll (true axial rotations).
-_JOINT_MIRROR_MAP = (
-    ( 6, +1.0), ( 7, -1.0), ( 8, +1.0), ( 9, +1.0), (10, +1.0), (11, -1.0),  # left leg → right leg
-    ( 0, +1.0), ( 1, -1.0), ( 2, +1.0), ( 3, +1.0), ( 4, +1.0), ( 5, -1.0),  # right leg → left leg
-    (12, -1.0), (13, -1.0), (14, +1.0),                                      # waist yaw/roll flip; pitch keeps
-    (22, +1.0), (23, -1.0), (24, +1.0), (25, +1.0), (26, -1.0), (27, +1.0), (28, +1.0),  # left arm → right arm
-    (15, +1.0), (16, -1.0), (17, +1.0), (18, +1.0), (19, -1.0), (20, +1.0), (21, +1.0),  # right arm → left arm
-)
-assert len(_JOINT_MIRROR_MAP) == len(G1_JOINTS), "_JOINT_MIRROR_MAP out of sync with G1_JOINTS"
-
-
 # Scene builders.
 def _get_table_spec() -> mujoco.MjSpec:
     """Build the MjSpec for the table (top + four legs).
@@ -1213,24 +1195,9 @@ def body_touched_box(env, sensor_name: str = "body_box_contact",
 _WALK_BUFFER_CACHE: dict[str, torch.Tensor] | None = None
 
 
-def _load_walk_buffer(path: str, device: torch.device,
-                      min_upright: float   = 0.98,
-                      root_z_range: tuple[float, float] = (0.72, 0.78),
-                      max_lin_vel: float   = 0.40,
-                      max_ang_vel: float   = 0.60,
-                      max_joint_vel: float = 4.00) -> dict[str, torch.Tensor]:
-    """Load and filter the .npz walk-terminal buffer to keep only near-static entries.
-    Filter (all conditions must hold) drops mid-cycle snapshots where a foot is up
-    or the robot is mid-stride, keeps only frames where the walk policy happened
-    to be transitioning through a quasi-static pose:
-      * trunk upright: up_z from quat_zy >= min_upright (~<18° tilt at 0.95)
-      * root height inside range (default 0.72-0.78 m, brackets the G1 standing height)
-      * base linear velocity magnitude <= max_lin_vel
-      * base angular velocity magnitude <= max_ang_vel
-      * max |joint velocity| across joints <= max_joint_vel
-    If the filter leaves fewer than 1024 or n_before/20 entries, falls back to
-    unfiltered (avoids resample lockup).
-    Args: path — buffer file; device — torch device; min_upright/root_z_range/max_lin_vel/max_ang_vel/max_joint_vel — filter thresholds (see above).
+def _load_walk_buffer(path: str, device: torch.device) -> dict[str, torch.Tensor]:
+    """Load the .npz walk-terminal buffer once and cache tensors on device.
+    Args: path — buffer file; device — torch device.
     Returns: dict of buffer name to tensor (plus a "_path" sentinel).
     """
     global _WALK_BUFFER_CACHE
@@ -1245,37 +1212,6 @@ def _load_walk_buffer(path: str, device: torch.device,
             )
         arr = _np.load(p)
         cache = {k: torch.from_numpy(arr[k]).float().to(device) for k in arr.files}
-
-        # quat_zy = (w, x, y, z); up_z = 1 - 2*(x^2 + y^2) (yaw already stripped).
-        q = cache["quat_zy"]
-        x, y = q[:, 1], q[:, 2]
-        up_z = 1.0 - 2.0 * (x * x + y * y)
-        root_z = cache["root_z"].squeeze(-1)
-        lin_vel_norm = cache["lin_vel_by"].norm(dim=-1)
-        ang_vel_norm = cache["ang_vel_by"].norm(dim=-1)
-        joint_vel_max = cache["joint_vel"].abs().max(dim=-1).values
-
-        keep = (
-            (up_z >= min_upright)
-            & (root_z >= root_z_range[0]) & (root_z <= root_z_range[1])
-            & (lin_vel_norm <= max_lin_vel)
-            & (ang_vel_norm <= max_ang_vel)
-            & (joint_vel_max <= max_joint_vel)
-        )
-        n_before = q.shape[0]
-        n_after  = int(keep.sum().item())
-        print(f"[walk_buffer filter] kept {n_after}/{n_before} entries "
-              f"({100.0 * n_after / n_before:.1f}%)")
-
-        if n_after < max(1024, n_before // 20):
-            print(f"[walk_buffer filter] fell below fallback threshold "
-                  f"(max(1024, n/20) = {max(1024, n_before // 20)}) - using unfiltered buffer instead.")
-            keep = torch.ones_like(keep)
-            n_after = n_before
-
-        for k in list(cache.keys()):
-            if isinstance(cache[k], torch.Tensor) and cache[k].shape[0] == n_before:
-                cache[k] = cache[k][keep].contiguous()
         cache["_path"] = path  # type: ignore[assignment]
         _WALK_BUFFER_CACHE = cache
     return _WALK_BUFFER_CACHE
@@ -1864,158 +1800,6 @@ def build_g1_pick_mdp():
         "terminations": terminations,
         "curriculum":   curriculum,
     }
-
-
-# PPO mirror data augmentation.
-# The mirror hypothesis: for a symmetric task like pick, any (obs, action)
-# pair reflected across the robot's sagittal plane is equally valid training
-# data. Doubling the effective sample size via mirror augmentation biases
-# the policy toward left-right symmetric strategies (like wrist-pinching).
-#
-# Assumption: robot's sagittal plane ≈ world y=0 plane. Valid for pick
-# because the robot spawns facing +x and stays there (no yaw command).
-# Would break for locomotion policies where yaw varies freely.
-_PICK_OBS_LAYOUT = (
-    # (term_name, dim, mirror_op) — MUST match the actor_terms dict order in
-    # build_pick_mdp exactly. Terms with mirror_op="pair_left" MUST be
-    # immediately followed by a "pair_right" of the same dim; they swap.
-    ("base_lin_vel",           3, "vec_body"),      # [x,-y,z]
-    ("base_ang_vel",           3, "pseudo_body"),   # [-x,y,-z] (angular vel is a pseudovector)
-    ("projected_gravity",      3, "vec_body"),
-    ("joint_pos",             29, "joints"),
-    ("joint_vel",             29, "joints"),
-    ("actions",               29, "joints"),
-    ("left_hand_to_box",       3, "pair_left"),     # swap with right, then vec_body flip
-    ("right_hand_to_box",      3, "pair_right"),
-    ("trunk_to_box",           3, "vec_body"),      # trunk is centerline
-    ("wrist_torque",           6, "wrist_torque"),  # 3 left + 3 right actuators, swap+sign
-    ("box_pos",                3, "vec_body"),      # body-relative delta
-    ("box_lin_vel",            3, "vec_body"),
-    ("box_ang_vel",            3, "pseudo_body"),
-    ("box_orientation",        4, "quat"),          # (w, -x, y, -z)
-    ("box_size",               3, "identity"),
-    ("cmd_grasp_offset_left",  3, "pair_left"),
-    ("cmd_grasp_offset_right", 3, "pair_right"),
-    ("cmd_object_target_pos",  3, "vec_body"),
-    ("cmd_object_target_quat", 4, "quat"),
-    ("cmd_lift_target_pos",    3, "vec_body"),
-    ("cmd_lift_target_quat",   4, "quat"),
-)
-
-
-def _mirror_joint_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Apply _JOINT_MIRROR_MAP to the last-dim = 29 joint-ordered tensor.
-    Args: t — tensor (..., 29).
-    Returns: tensor (..., 29) with joints swapped left↔right and signs applied.
-    """
-    idx  = torch.tensor([m[0] for m in _JOINT_MIRROR_MAP], device=t.device, dtype=torch.long)
-    sign = torch.tensor([m[1] for m in _JOINT_MIRROR_MAP], device=t.device, dtype=t.dtype)
-    return t.index_select(-1, idx) * sign
-
-
-# Wrist actuators, in the order emitted by wrist_actuator_force_obs (from wrist_acts
-# SceneEntityCfg with pattern r".*wrist.*"). G1_JOINTS gives us canonical order.
-_WRIST_ACTUATOR_INDICES = tuple(i for i, j in enumerate(G1_JOINTS) if "wrist" in j)  # 6 indices
-# Mirror map restricted to the 6 wrist actuators: swap left↔right + signs.
-_WRIST_MIRROR = tuple(
-    (
-        _WRIST_ACTUATOR_INDICES.index(_JOINT_MIRROR_MAP[wi][0]),
-        _JOINT_MIRROR_MAP[wi][1],
-    )
-    for wi in _WRIST_ACTUATOR_INDICES
-)
-
-
-def _mirror_wrist_torque(t: torch.Tensor) -> torch.Tensor:
-    """Swap and sign-flip the 6 wrist actuator torques.
-    Args: t — tensor (..., 6).
-    Returns: tensor (..., 6) mirrored.
-    """
-    idx  = torch.tensor([m[0] for m in _WRIST_MIRROR], device=t.device, dtype=torch.long)
-    sign = torch.tensor([m[1] for m in _WRIST_MIRROR], device=t.device, dtype=t.dtype)
-    return t.index_select(-1, idx) * sign
-
-
-def _mirror_obs_slice(chunk: torch.Tensor, op: str) -> torch.Tensor:
-    """Apply the given mirror op to one obs slice.
-    Args: chunk — tensor (..., dim); op — mirror-op string from _PICK_OBS_LAYOUT.
-    Returns: mirrored slice (same shape as chunk).
-    """
-    if op == "identity":
-        return chunk
-    if op == "vec_body":
-        out = chunk.clone(); out[..., 1] = -out[..., 1]; return out
-    if op == "pseudo_body":
-        out = chunk.clone(); out[..., 0] = -out[..., 0]; out[..., 2] = -out[..., 2]; return out
-    if op == "quat":
-        out = chunk.clone(); out[..., 1] = -out[..., 1]; out[..., 3] = -out[..., 3]; return out
-    if op == "joints":
-        return _mirror_joint_tensor(chunk)
-    if op == "wrist_torque":
-        return _mirror_wrist_torque(chunk)
-    raise ValueError(f"unknown mirror op: {op}")
-
-
-def _mirror_obs(obs: torch.Tensor) -> torch.Tensor:
-    """Mirror the flat actor obs tensor by walking _PICK_OBS_LAYOUT slice by slice.
-    Handles 'pair_left'/'pair_right' by swapping the two contiguous chunks (both are
-    body-frame vecs, so also apply vec_body after the swap).
-    Args: obs — tensor (batch, total_dim).
-    Returns: tensor (batch, total_dim) mirrored.
-    """
-    parts: list[torch.Tensor] = []
-    i = 0
-    idx = 0
-    layout = _PICK_OBS_LAYOUT
-    while idx < len(layout):
-        name, dim, op = layout[idx]
-        if op == "pair_left":
-            _, dim_r, op_r = layout[idx + 1]
-            assert op_r == "pair_right" and dim_r == dim, f"pair mismatch at {name}"
-            left  = obs[..., i:i + dim]
-            right = obs[..., i + dim:i + 2 * dim]
-            parts.append(_mirror_obs_slice(right, "vec_body"))
-            parts.append(_mirror_obs_slice(left,  "vec_body"))
-            i += 2 * dim
-            idx += 2
-        else:
-            parts.append(_mirror_obs_slice(obs[..., i:i + dim], op))
-            i += dim
-            idx += 1
-    assert i == obs.shape[-1], (
-        f"obs mirror layout mismatch: consumed {i} dims, obs has {obs.shape[-1]}. "
-        f"Verify _PICK_OBS_LAYOUT matches the actor_terms dict in build_pick_mdp."
-    )
-    return torch.cat(parts, dim=-1)
-
-
-def mirror_pick_augmentation(env, obs=None, actions=None, obs_type: str = "policy"):
-    """rsl_rl data_augmentation_func: return the mirrored (obs, actions) pair.
-    Accepts plain torch tensors OR TensorDicts (rsl_rl 5.x wraps obs as TensorDict
-    with actor/critic leaves that share pick's layout).
-    Args: env — VecEnv wrapper (unused; kept for API); obs — (batch, obs_dim) tensor or TensorDict or None; actions — (batch, action_dim) tensor or TensorDict or None; obs_type — 'policy' or 'critic', both share the same 147-dim layout in pick.
-    Returns: (mirrored_obs, mirrored_actions), each None if the input was None.
-    """
-    def _apply_mirror(x, fn):
-        if x is None:
-            return None
-        if isinstance(x, torch.Tensor):
-            return fn(x)
-        return x.apply(fn)
-
-    return (
-        _apply_mirror(obs, _mirror_obs),
-        _apply_mirror(actions, _mirror_joint_tensor),
-    )
-
-
-# Wired into the runner by train_loop.py when this constant is present on the module.
-SYMMETRY_CFG = {
-    "use_data_augmentation": True,
-    "use_mirror_loss": False,
-    "mirror_loss_coeff": 0.0,
-    "data_augmentation_func": mirror_pick_augmentation,
-}
 
 
 def g1_pick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
