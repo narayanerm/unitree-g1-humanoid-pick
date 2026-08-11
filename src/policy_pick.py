@@ -75,28 +75,7 @@ G1_FOOT_GEOMS = tuple(
 )
 
 
-# Ready-arm pose snapped at reset (post reset_from_walk_buffer) so every env starts with hands forward-down over the box; cuts the ~100-iter arm-scramble phase and prevents the ep_length=9 collapse. Not fully closed like HOLDING_ARM_POSE — the policy still has to descend and squeeze.
-READY_ARM_POSE = {
-    # Arms nearly extended toward the box: shoulder pitch forward-down (~49° from vertical), elbows mildly bent so hands land at x~0.46, z~0.79 (~20 cm from the box anchor at 0.51, ±0.13, 0.605), shoulder roll near zero so hands sit close to the sagittal plane.
-    "left_shoulder_pitch_joint":  -0.85,
-    "left_shoulder_roll_joint":    0.05,
-    "left_shoulder_yaw_joint":     0.0,
-    "left_elbow_joint":            0.15,
-    "left_wrist_roll_joint":       0.0,
-    "left_wrist_pitch_joint":      0.0,
-    "left_wrist_yaw_joint":        0.0,
-    "right_shoulder_pitch_joint": -0.85,
-    "right_shoulder_roll_joint":  -0.05,
-    "right_shoulder_yaw_joint":    0.0,
-    "right_elbow_joint":           0.15,
-    "right_wrist_roll_joint":      0.0,
-    "right_wrist_pitch_joint":     0.0,
-    "right_wrist_yaw_joint":       0.0,
-}
-READY_ARM_JOINTS = tuple(READY_ARM_POSE.keys())
-
-
-# Target arm pose for the terminal hold-at-chest phase; mirrors HOLDING_ARM_POSE from policy_carry so pick's terminal snapshot matches the posture carry expects at reset (shoulders less pitched-down, elbows more flexed, rolls opened outward for chest-hug). Same joint order as READY_ARM_JOINTS so arm_asset can index either.
+# Terminal arm pose for the chest-hold phase; used inside CARRY_READY_POSE so pick's terminal snapshot matches the posture carry expects at reset (shoulders less pitched-down, elbows flexed, rolls opened outward for chest-hug).
 HOLDING_ARM_POSE = {
     "left_shoulder_pitch_joint":  -0.70,
     "left_shoulder_roll_joint":    0.20,
@@ -113,9 +92,51 @@ HOLDING_ARM_POSE = {
     "right_wrist_pitch_joint":     0.0,
     "right_wrist_yaw_joint":       0.0,
 }
-assert tuple(HOLDING_ARM_POSE.keys()) == READY_ARM_JOINTS, (
-    "HOLDING_ARM_POSE must share joint order with READY_ARM_POSE so arm_asset indexes both."
+
+
+# Full-body squat-and-grip pose used as the curriculum starting state (body_bias=1.0). Robot spawns deeply squatting IN FRONT OF the table (SQUAT_GRIP_ROOT_POS pushes pelvis to x~0.20 world) with waist pitched forward and both wrists positioned at the box side-face anchors (x~0.51, y~±0.13, z~0.605) so the policy can learn the grip/lift dynamics from an ideal start before pick_curriculum ramps body_bias to 0.0 (walk-buffer sample at world origin). Values are geometric approximations — verify in viewer and tune the leg-flex / waist-pitch / shoulder-pitch / elbow quartet if wrists don't sit exactly at the box on reset.
+SQUAT_GRIP_POSE = {
+    # Legs: moderate squat (not deep) so knees stay clear of the table front edge (x=0.26) while pelvis is at x=0. hip+knee+ankle sum to zero so feet land flat.
+    "left_hip_pitch_joint":   -0.80,
+    "left_hip_roll_joint":     0.12,
+    "left_hip_yaw_joint":      0.0,
+    "left_knee_joint":         1.40,
+    "left_ankle_pitch_joint": -0.60,
+    "left_ankle_roll_joint":   0.0,
+    "right_hip_pitch_joint":  -0.80,
+    "right_hip_roll_joint":   -0.12,
+    "right_hip_yaw_joint":     0.0,
+    "right_knee_joint":        1.40,
+    "right_ankle_pitch_joint":-0.60,
+    "right_ankle_roll_joint":  0.0,
+    # Waist: heavy forward pitch (~52°) brings the shoulders forward so arms can reach the box side faces without moving the pelvis into the table footprint.
+    "waist_yaw_joint":         0.0,
+    "waist_roll_joint":        0.0,
+    "waist_pitch_joint":       0.90,
+    # Arms: strong shoulder_pitch forward-down, shoulder_roll opened outward to y~±0.13, elbow moderately bent (~63°) so the pose is visibly bent. Empirical FK sweep places the wrists at (0.502, ±0.107, 0.627) — 3 cm from the target box side-face anchor at (0.51, ±0.13, 0.605).
+    "left_shoulder_pitch_joint":  -1.60,
+    "left_shoulder_roll_joint":    0.25,
+    "left_shoulder_yaw_joint":     0.0,
+    "left_elbow_joint":            1.10,
+    "left_wrist_roll_joint":       0.0,
+    "left_wrist_pitch_joint":      0.0,
+    "left_wrist_yaw_joint":        0.0,
+    "right_shoulder_pitch_joint": -1.60,
+    "right_shoulder_roll_joint":  -0.25,
+    "right_shoulder_yaw_joint":    0.0,
+    "right_elbow_joint":           1.10,
+    "right_wrist_roll_joint":      0.0,
+    "right_wrist_pitch_joint":     0.0,
+    "right_wrist_yaw_joint":       0.0,
+}
+assert set(SQUAT_GRIP_POSE.keys()) == set(G1_JOINTS), (
+    f"SQUAT_GRIP_POSE must cover all 29 G1 joints; missing "
+    f"{set(G1_JOINTS) - set(SQUAT_GRIP_POSE.keys())}, extra "
+    f"{set(SQUAT_GRIP_POSE.keys()) - set(G1_JOINTS)}."
 )
+# Pelvis at world (0.0, 0, 0.65): x=0 keeps the pelvis behind the table front edge (0.26) so the moderately-flexed knees (at x~0.24) stay just clear of the table; z=0.65 puts the feet flat on the ground with the current hip/knee/ankle flexion. reset_from_walk_buffer lerps root_xy between the walk default (0,0) and this squat position by body_bias.
+SQUAT_GRIP_ROOT_POS = (0.0, 0.0, 0.65)
+SQUAT_GRIP_ROOT_ROT = (1.0, 0.0, 0.0, 0.0)  # identity — waist_pitch carries the trunk lean via joints
 
 
 # Full-body carry-ready pose: KNEES_BENT_KEYFRAME legs (mjlab canonical G1 home used by walk/carry) + waist upright + HOLDING_ARM_POSE arms wrapped around the box. Used as the target for carry_ready_pose_reward so a walk -> pick -> carry state-machine handoff sees consistent postures at every transition.
@@ -169,7 +190,7 @@ GRASP_NOMINAL_Y   = 0.13   # left-hand nominal y in box frame (right mirrors)
 GRASP_NOMINAL_Z   = 0.02
 GRASP_JITTER      = 0.03
 
-# Box spawns on the table with zero velocity plus tight ±5 cm xy and ±20° yaw jitter; wider jitter combined with hand_bias > 0 let the policy "catch the falling box" instead of picking from the table.
+# Box always spawns resting on the table with tight ±5 cm xy and ±20° yaw jitter; the pick curriculum only modulates the robot's starting pose (SQUAT_GRIP -> walk buffer), never the box spawn.
 OBJECT_XY_JITTER_X = 0.05
 OBJECT_XY_JITTER_Y = 0.05
 OBJECT_YAW_RANGE   = math.radians(20.0)
@@ -363,60 +384,12 @@ def _ensure_cmd_buffers(env: ManagerBasedRlEnv) -> None:
         env.extras[_CMD_KEY + qname][:, 0] = 1.0
 
 
-def reset_arms_to_ready(
-    env: ManagerBasedRlEnv,
-    env_ids: torch.Tensor | None,
-    asset_cfg: SceneEntityCfg,
-    arm_bias: float = 1.0,
-    buffer_path: str = WALK_BUFFER_PATH,
-) -> None:
-    """Interpolate the 14 arm joints between READY_ARM_POSE and a walk-buffer sample.
-    Args: env — RL env; env_ids — envs to reset (None = all); asset_cfg — robot entity selecting the 14 arm joints; arm_bias — READY-vs-walk mix in [0, 1] ramped 1 -> 0 by pick_curriculum so the trained policy tolerates the arm poses a real walk -> pick handoff presents; buffer_path — walk buffer file used when arm_bias < 1.
-    Returns: none.
-    """
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
-    n = len(env_ids)
-    if n == 0:
-        return
-    ab = float(max(0.0, min(1.0, arm_bias)))
-    if ab <= 0.0:
-        return  # Leave arms as reset_from_walk_buffer left them (same snapshot as legs).
-
-    asset: Entity = env.scene[asset_cfg.name]
-    joint_ids = asset_cfg.joint_ids
-    if isinstance(joint_ids, list):
-        joint_ids_t = torch.tensor(joint_ids, device=env.device)
-    else:
-        joint_ids_t = joint_ids
-
-    ready = torch.tensor(
-        [READY_ARM_POSE[j] for j in asset_cfg.joint_names],
-        device=env.device,
-    ).unsqueeze(0).expand(n, -1).clone()  # (n, 14)
-
-    if ab >= 1.0:
-        pose = ready
-    else:
-        # Independent walk sample for the arms — decorrelates from legs' snapshot but the buffer distribution is what matters here.
-        buf = _load_walk_buffer(buffer_path, env.device)
-        total = buf["joint_pos"].shape[0]
-        idx = torch.randint(0, total, (n,), device=env.device)
-        walk_arms = buf["joint_pos"][idx][:, joint_ids_t]  # (n, 14)
-        pose = ab * ready + (1.0 - ab) * walk_arms
-
-    vel = torch.zeros_like(pose)
-    asset.write_joint_state_to_sim(pose, vel, joint_ids=joint_ids_t, env_ids=env_ids)
-
-
 def reset_pick_command_and_object(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
-    scale: float = 1.0,
-    hand_bias: float = 0.0,
 ) -> None:
-    """Sample the 20-D command and write the box spawn so they match.
-    Args: env — the RL env; env_ids — envs to reset (all if None); scale — curriculum range multiplier in [0, 1] applied to xy/yaw jitter; hand_bias — curriculum interpolation in [0, 1] between "box on table" (0) and "box already in hands at chest" (1). Set to 1.0 early in training so the policy discovers the lift phase before having to reach; ramped to 0 by pick_curriculum.
+    """Sample the 20-D command and write the box spawn (always resting on the table with fixed jitter ranges).
+    Args: env — the RL env; env_ids — envs to reset (all if None).
     Returns: none.
     """
     from mjlab.utils.lab_api.math import sample_uniform, quat_from_euler_xyz
@@ -432,20 +405,14 @@ def reset_pick_command_and_object(
     origins = env.scene.env_origins[env_ids]
     zero = torch.zeros(n, device=device)
 
-    # Interpolate box spawn between table position (default) and "in hands" (chest height, close to the robot spawn) based on hand_bias; jitter only applies to the table component so the "in hands" pose is stable.
-    ox = sample_uniform(-OBJECT_XY_JITTER_X * scale, OBJECT_XY_JITTER_X * scale, (n,), device=device)
-    oy = sample_uniform(-OBJECT_XY_JITTER_Y * scale, OBJECT_XY_JITTER_Y * scale, (n,), device=device)
-    o_yaw = sample_uniform(-OBJECT_YAW_RANGE * scale, OBJECT_YAW_RANGE * scale, (n,), device=device)
-    table_x = BOX_START_X + ox
-    table_z = torch.full((n,), BOX_START_Z, device=device)
-    # "In hands" target: right at the estimated READY_ARM_POSE hand position.
-    hands_x = torch.full((n,), 0.46, device=device)
-    hands_z = torch.full((n,), 0.79, device=device)
-    hb = float(max(0.0, min(1.0, hand_bias)))
+    # Box always resting on the table with fixed ±5 cm xy / ±20° yaw jitter; no curriculum on the box itself so the task the policy solves stays identical across training.
+    ox = sample_uniform(-OBJECT_XY_JITTER_X, OBJECT_XY_JITTER_X, (n,), device=device)
+    oy = sample_uniform(-OBJECT_XY_JITTER_Y, OBJECT_XY_JITTER_Y, (n,), device=device)
+    o_yaw = sample_uniform(-OBJECT_YAW_RANGE, OBJECT_YAW_RANGE, (n,), device=device)
     obj_pos_w = torch.stack([
-        origins[:, 0] + (1.0 - hb) * table_x + hb * hands_x,
-        origins[:, 1] + (1.0 - hb) * oy,
-        origins[:, 2] + (1.0 - hb) * table_z + hb * hands_z,
+        origins[:, 0] + BOX_START_X + ox,
+        origins[:, 1] + oy,
+        origins[:, 2] + BOX_START_Z,
     ], dim=-1)
     obj_quat_w = quat_from_euler_xyz(zero, zero, o_yaw)
 
@@ -462,10 +429,9 @@ def reset_pick_command_and_object(
     env.extras[_CMD_KEY + "object_target_quat"][env_ids] = obj_quat_w
 
     # Grasp offsets in box frame; right mirrors left across sagittal plane.
-    jitter = GRASP_JITTER * scale
-    gdx = sample_uniform(-jitter, jitter, (n,), device=device)
-    gdy = sample_uniform(-jitter, jitter, (n,), device=device)
-    gdz = sample_uniform(-jitter, jitter, (n,), device=device)
+    gdx = sample_uniform(-GRASP_JITTER, GRASP_JITTER, (n,), device=device)
+    gdy = sample_uniform(-GRASP_JITTER, GRASP_JITTER, (n,), device=device)
+    gdz = sample_uniform(-GRASP_JITTER, GRASP_JITTER, (n,), device=device)
     grasp_left = torch.stack([
         gdx,
         torch.full((n,), GRASP_NOMINAL_Y, device=device) + gdy,
@@ -477,15 +443,15 @@ def reset_pick_command_and_object(
     env.extras[_CMD_KEY + "grasp_offset_right"][env_ids] = grasp_right
 
     # Lift target pose.
-    lx = sample_uniform(-LIFT_X_HALF * scale, LIFT_X_HALF * scale, (n,), device=device)
-    ly = sample_uniform(-LIFT_Y_HALF * scale, LIFT_Y_HALF * scale, (n,), device=device)
-    lz = sample_uniform(-LIFT_Z_HALF * scale, LIFT_Z_HALF * scale, (n,), device=device)
+    lx = sample_uniform(-LIFT_X_HALF, LIFT_X_HALF, (n,), device=device)
+    ly = sample_uniform(-LIFT_Y_HALF, LIFT_Y_HALF, (n,), device=device)
+    lz = sample_uniform(-LIFT_Z_HALF, LIFT_Z_HALF, (n,), device=device)
     lift_pos_w = torch.stack([
         origins[:, 0] + LIFT_X_CENTER + lx,
         origins[:, 1] + ly,
         origins[:, 2] + CHEST_Z + lz,
     ], dim=-1)
-    l_yaw = sample_uniform(-LIFT_YAW_RANGE * scale, LIFT_YAW_RANGE * scale, (n,), device=device)
+    l_yaw = sample_uniform(-LIFT_YAW_RANGE, LIFT_YAW_RANGE, (n,), device=device)
     lift_quat_w = quat_from_euler_xyz(zero, zero, l_yaw)
     env.extras[_CMD_KEY + "lift_target_pos"][env_ids]  = lift_pos_w
     env.extras[_CMD_KEY + "lift_target_quat"][env_ids] = lift_quat_w
@@ -1217,7 +1183,7 @@ def box_fell_back(env, box_cfg,
                   high_thresh: float = 0.10,
                   settle_thresh: float = 0.03,
                   min_step: int = 30):
-    """Terminate when the box, after ever rising high_thresh above the resting-on-table position, drops back within settle_thresh of it; grace-gated on episode_length_buf ≥ min_step so the hand_bias=1.0 free-fall spawn doesn't kill the episode before the policy can grip.
+    """Terminate when the box, after ever rising high_thresh above the resting-on-table position, drops back within settle_thresh of it; grace-gated on episode_length_buf ≥ min_step so early transient contacts at reset can't kill the episode before the policy has time to grip.
     Args: env — RL env; box_cfg — box entity; high_thresh — clearance above resting height that counts as "lifted"; settle_thresh — proximity to resting height that counts as "back on the table"; min_step — grace period in policy steps before this termination can fire.
     Returns: (num_envs,) bool tensor.
     """
@@ -1336,13 +1302,14 @@ def reset_from_walk_buffer(
     xy_range: tuple[float, float],
     yaw_range: tuple[float, float],
     asset_cfg: SceneEntityCfg,
+    body_bias: float = 0.0,
 ) -> None:
-    """Sample a walk-terminal state per env and write it to the robot, with jitter.
-    Args: env — the RL env; env_ids — envs to reset (all if None); buffer_path — path to the .npz buffer; xy_range — additive xy jitter bounds; yaw_range — additive yaw jitter bounds in rad; asset_cfg — robot entity config.
+    """Reset the full body by linearly interpolating between SQUAT_GRIP_POSE (body_bias=1.0, robot spawns already gripping the box) and a sampled walk-terminal state (body_bias=0.0, realistic post-walk posture). Joint positions, root z and root quat all lerp together so pick_curriculum can move the starting state along a single monotonic axis without the reward-magnitude / task-swap discontinuities the old hand_bias / arm_bias two-axis curriculum introduced.
+    Args: env — the RL env; env_ids — envs to reset (all if None); buffer_path — path to the .npz walk buffer; xy_range — additive xy jitter bounds; yaw_range — additive yaw jitter bounds in rad; asset_cfg — robot entity config covering all 29 G1 joints in G1_JOINTS order; body_bias — curriculum weight in [0, 1], 1.0 = pure SQUAT_GRIP, 0.0 = pure walk sample.
     Returns: none.
     """
     from mjlab.utils.lab_api.math import (
-        quat_apply, quat_from_euler_xyz, quat_mul, sample_uniform,
+        quat_from_euler_xyz, quat_mul, sample_uniform,
     )
 
     if env_ids is None:
@@ -1351,44 +1318,73 @@ def reset_from_walk_buffer(
     if n == 0:
         return
 
-    buf = _load_walk_buffer(buffer_path, env.device)
+    bb = float(max(0.0, min(1.0, body_bias)))
+    device = env.device
+
+    # Walk-buffer end of the interpolation.
+    buf = _load_walk_buffer(buffer_path, device)
     total = buf["root_z"].shape[0]
-    idx = torch.randint(0, total, (n,), device=env.device)
+    idx = torch.randint(0, total, (n,), device=device)
+    walk_z     = buf["root_z"][idx]                    # (n,) or (n, 1)
+    walk_quat  = buf["quat_zy"][idx]                   # (n, 4)
+    walk_joint = buf["joint_pos"][idx]                 # (n, 29) in G1_JOINTS order
 
-    root_z     = buf["root_z"][idx]
-    quat_zy    = buf["quat_zy"][idx]
-    joint_pos  = buf["joint_pos"][idx]
-    # Zero velocities at reset: inherit walking POSTURE without inertia; residual base/joint velocities were catapulting the robot into unrecoverable tilts (~9-step episodes).
-    joint_vel  = torch.zeros_like(buf["joint_vel"][idx])
+    # SQUAT_GRIP end of the interpolation.
+    squat_joint = torch.tensor(
+        [SQUAT_GRIP_POSE[j] for j in asset_cfg.joint_names],
+        device=device, dtype=torch.float32,
+    ).unsqueeze(0).expand(n, -1).clone()
+    squat_z = torch.full(walk_z.shape, SQUAT_GRIP_ROOT_POS[2], device=device)
+    squat_xy_offset = torch.tensor(
+        SQUAT_GRIP_ROOT_POS[:2], device=device, dtype=torch.float32,
+    ).unsqueeze(0).expand(n, -1).clone()
+    squat_quat = torch.tensor(
+        SQUAT_GRIP_ROOT_ROT, device=device, dtype=torch.float32,
+    ).unsqueeze(0).expand(n, -1).clone()
 
-    xy_jitter = sample_uniform(xy_range[0], xy_range[1], (n, 2), device=env.device)
-    yaw_jitter = sample_uniform(yaw_range[0], yaw_range[1], (n,), device=env.device)
+    # Full-body lerp; renormalise quaternion since lerp of unit quats drifts off the sphere.
+    joint_pos = bb * squat_joint + (1.0 - bb) * walk_joint
+    root_z    = bb * squat_z + (1.0 - bb) * walk_z
+    root_quat_base = bb * squat_quat + (1.0 - bb) * walk_quat
+    root_quat_base = root_quat_base / torch.linalg.norm(
+        root_quat_base, dim=-1, keepdim=True,
+    ).clamp(min=1e-6)
+
+    # Zero velocities at reset: inherit posture without inertia (residual base/joint velocities used to catapult the robot into unrecoverable tilts).
+    joint_vel = torch.zeros_like(joint_pos)
+    lin_vel = torch.zeros(n, 3, device=device)
+    ang_vel = torch.zeros(n, 3, device=device)
+
+    # Scale jitter by (1 - body_bias) so squat mode spawns the robot deterministically in front of the box (facing +x, at SQUAT_GRIP_ROOT_POS xy) and walk mode keeps the full DR range.
+    jitter_scale = 1.0 - bb
+    xy_jitter = sample_uniform(xy_range[0] * jitter_scale, xy_range[1] * jitter_scale, (n, 2), device=device)
+    yaw_jitter = sample_uniform(yaw_range[0] * jitter_scale, yaw_range[1] * jitter_scale, (n,), device=device)
     zero = torch.zeros_like(yaw_jitter)
     q_yaw = quat_from_euler_xyz(zero, zero, yaw_jitter)
-    root_quat = quat_mul(q_yaw, quat_zy)
-    lin_vel = torch.zeros(n, 3, device=env.device)
-    ang_vel = torch.zeros(n, 3, device=env.device)
+    root_quat = quat_mul(q_yaw, root_quat_base)
 
     asset: Entity = env.scene[asset_cfg.name]
     default_root_state = asset.data.default_root_state[env_ids].clone()
     origins = env.scene.env_origins[env_ids]
 
-    root_xy = default_root_state[:, 0:2] + xy_jitter + origins[:, 0:2]
-    root_z_w = root_z + origins[:, 2:3]
+    # Blend root_xy between the walk-default (from default_root_state) and the SQUAT offset (which is an absolute world offset from the env origin, not additive to walk default). Using (1-bb)*default + bb*squat keeps both endpoints correct: at bb=0 the pelvis lands at walk default, at bb=1 at exactly SQUAT_GRIP_ROOT_POS[:2].
+    root_xy = (1.0 - bb) * default_root_state[:, 0:2] + bb * squat_xy_offset + xy_jitter + origins[:, 0:2]
+    root_z_col = root_z if root_z.dim() == 2 else root_z.unsqueeze(-1)
+    root_z_w = root_z_col + origins[:, 2:3]
     positions = torch.cat([root_xy, root_z_w], dim=-1)
 
     asset.write_root_link_pose_to_sim(
-        torch.cat([positions, root_quat], dim=-1), env_ids=env_ids
+        torch.cat([positions, root_quat], dim=-1), env_ids=env_ids,
     )
     asset.write_root_link_velocity_to_sim(
-        torch.cat([lin_vel, ang_vel], dim=-1), env_ids=env_ids
+        torch.cat([lin_vel, ang_vel], dim=-1), env_ids=env_ids,
     )
 
     joint_ids = asset_cfg.joint_ids
     if isinstance(joint_ids, list):
-        joint_ids = torch.tensor(joint_ids, device=env.device)
+        joint_ids = torch.tensor(joint_ids, device=device)
     asset.write_joint_state_to_sim(
-        joint_pos, joint_vel, env_ids=env_ids, joint_ids=joint_ids
+        joint_pos, joint_vel, env_ids=env_ids, joint_ids=joint_ids,
     )
 
 
@@ -1402,12 +1398,12 @@ def _smoothstep(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
-# Optional curriculum freeze — when set, pick_curriculum reports this step forever so the viewer path can run at the same (arm_bias, hand_bias, scale) the last training checkpoint converged to; None = training mode.
+# Optional curriculum freeze — when set, pick_curriculum reports this step forever so the viewer path can run at the same body_bias the last training checkpoint converged to; None = training mode.
 _PICK_CURRICULUM_LOCKED_STEP: int | None = None
 
 
 def lock_curriculum_at_iter(iter_num: int | None, num_steps_per_env: int = 24) -> None:
-    """Freeze pick_curriculum at the step corresponding to a given PPO iteration so a resumed viewer run shows the trained (arm_bias, hand_bias, scale) instead of restarting from the box-in-air warmup phase.
+    """Freeze pick_curriculum at the step corresponding to a given PPO iteration so a resumed viewer run shows the trained body_bias instead of restarting from the SQUAT_GRIP warmup phase.
     Args: iter_num — PPO iteration count parsed from a checkpoint filename; pass None to unlock; num_steps_per_env — must match the PPO cfg (default 24, matches g1_pick_ppo_runner_cfg).
     Returns: none.
     """
@@ -1419,51 +1415,31 @@ def lock_curriculum_at_iter(iter_num: int | None, num_steps_per_env: int = 24) -
 
 
 def pick_curriculum(env, env_ids):
-    """Ramp reset-base jitter, command ranges, arm_bias, and hand_bias across training stages.
+    """Single-axis curriculum ramping body_bias from 1.0 (robot spawns in SQUAT_GRIP_POSE, hands already at the box on the table) to 0.0 (robot spawns from a walk-terminal sample). No box curriculum — the box always spawns on the table so the task the policy solves stays identical across training, which keeps the reward curve monotonic (no reward-ceiling shifts) unlike the previous two-axis hand_bias / arm_bias / scale ramp.
     Args: env — the RL env; env_ids — envs being updated (unused, curriculum is global).
-    Returns: dict with pick_scale, pick_hand_bias, pick_arm_bias for logging.
+    Returns: dict with pick_body_bias for logging.
     """
     # Per-env counter (fresh at every runner) instead of env.common_step_counter, which persists across runner.load() and made the curriculum skip past the ramp on resume.
     if _PICK_CURRICULUM_LOCKED_STEP is not None:
-        step = _PICK_CURRICULUM_LOCKED_STEP    # viewer / play mode: freeze at trained state
+        step = _PICK_CURRICULUM_LOCKED_STEP
     else:
         if not hasattr(env, "_pick_curriculum_step"):
             env._pick_curriculum_step = 0
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
-    # Sequential curriculum (num_steps_per_env=24): warmup (arm=READY, box in hands) -> arm ramp (READY -> walk sample) -> box ramp (in-hands -> on-table) -> full pick; smoothstep boundaries avoid gradient spikes at hand-offs.
+    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 -> 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses.
     if step < 24_000:
-        scale, hand_bias, arm_bias = 0.30, 1.0, 1.0
-    elif step < 48_000:                    # arm ramp phase
-        s = _smoothstep((step - 24_000) / (48_000 - 24_000))
-        scale, hand_bias, arm_bias = 0.30, 1.0, 1.0 - s
-    elif step < 96_000:                    # box ramp phase
-        s = _smoothstep((step - 48_000) / (96_000 - 48_000))
-        scale = 0.30 + 0.70 * s
-        hand_bias = 1.0 - s
-        arm_bias = 0.0
-    else:                                  # full pick task
-        scale, hand_bias, arm_bias = 1.00, 0.0, 0.0
-    xy_range  = (-0.12 * scale, 0.12 * scale)
-    yaw_range = (-0.30 * scale, 0.30 * scale)
+        body_bias = 1.0
+    elif step < 96_000:
+        body_bias = 1.0 - _smoothstep((step - 24_000) / (96_000 - 24_000))
+    else:
+        body_bias = 0.0
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_base")
-        term_cfg.params["xy_range"]  = xy_range
-        term_cfg.params["yaw_range"] = yaw_range
+        term_cfg.params["body_bias"] = body_bias
     except Exception:
         pass
-    try:
-        term_cfg = env.event_manager.get_term_cfg("reset_pick_cmd")
-        term_cfg.params["scale"]     = scale
-        term_cfg.params["hand_bias"] = hand_bias
-    except Exception:
-        pass
-    try:
-        term_cfg = env.event_manager.get_term_cfg("reset_arms_ready")
-        term_cfg.params["arm_bias"] = arm_bias
-    except Exception:
-        pass
-    return {"pick_scale": scale, "pick_hand_bias": hand_bias, "pick_arm_bias": arm_bias}
+    return {"pick_body_bias": body_bias}
 
 
 # MDP assembly.
@@ -1488,7 +1464,6 @@ def build_g1_pick_mdp():
     )
 
     g1_asset    = SceneEntityCfg("robot", joint_names=G1_JOINTS, preserve_order=True)
-    arm_asset   = SceneEntityCfg("robot", joint_names=READY_ARM_JOINTS, preserve_order=True)
     left_sym    = SceneEntityCfg("robot", joint_names=_LEFT_SYM_JOINTS,  preserve_order=True)
     right_sym   = SceneEntityCfg("robot", joint_names=_RIGHT_SYM_JOINTS, preserve_order=True)
     wrist_acts  = SceneEntityCfg("robot", actuator_names=(r".*wrist.*",), preserve_order=True)
@@ -1540,12 +1515,12 @@ def build_g1_pick_mdp():
     )
     body_table_contact_cfg = ContactSensorCfg(
         name="body_table_contact",
-        # Torso + leg bodies only (arms excluded so reaching hands don't fire, feet excluded because they walk on the ground).
+        # Torso + real-limb bodies (arms/feet excluded, hip_roll/hip_yaw pivots also excluded — they are small internal pivot links that sit right at the table_top elevation in SQUAT_GRIP and produce false-positive terminations at reset; hip_pitch is the "real hip" limb that would actually collapse onto the table).
         primary=ContactMatch(
             mode="body",
             pattern=r"^(torso_link"
-                     r"|left_hip_pitch_link|left_hip_roll_link|left_hip_yaw_link|left_knee_link|left_ankle_pitch_link"
-                     r"|right_hip_pitch_link|right_hip_roll_link|right_hip_yaw_link|right_knee_link|right_ankle_pitch_link"
+                     r"|left_hip_pitch_link|left_knee_link|left_ankle_pitch_link"
+                     r"|right_hip_pitch_link|right_knee_link|right_ankle_pitch_link"
                      r")$",
             entity="robot",
         ),
@@ -1556,12 +1531,12 @@ def build_g1_pick_mdp():
     )
     body_box_contact_cfg = ContactSensorCfg(
         name="body_box_contact",
-        # Same torso + leg body list with box as secondary; catches "leg resting on box" / "torso on box" (arms legitimately touch during grasp).
+        # Same real-limb list as body_table_contact (excludes hip_roll/hip_yaw pivots).
         primary=ContactMatch(
             mode="body",
             pattern=r"^(torso_link"
-                     r"|left_hip_pitch_link|left_hip_roll_link|left_hip_yaw_link|left_knee_link|left_ankle_pitch_link"
-                     r"|right_hip_pitch_link|right_hip_roll_link|right_hip_yaw_link|right_knee_link|right_ankle_pitch_link"
+                     r"|left_hip_pitch_link|left_knee_link|left_ankle_pitch_link"
+                     r"|right_hip_pitch_link|right_knee_link|right_ankle_pitch_link"
                      r")$",
             entity="robot",
         ),
@@ -1722,8 +1697,9 @@ def build_g1_pick_mdp():
         ),
     }
 
-    # Events: warm-buffer reset, command/box reset, domain randomization.
+    # Events: full-body reset with body_bias curriculum, command/box reset, domain randomization.
     events = {
+        # Interpolates the full body between SQUAT_GRIP_POSE (body_bias=1.0) and a walk-terminal sample; body_bias is overwritten every step by pick_curriculum.
         "reset_base": EventTermCfg(
             func=reset_from_walk_buffer,
             mode="reset",
@@ -1732,19 +1708,14 @@ def build_g1_pick_mdp():
                 "xy_range":  (-0.12, 0.12),
                 "yaw_range": (-0.30, 0.30),
                 "asset_cfg": g1_asset,
+                "body_bias": 1.0,
             },
         ),
-        # Interpolate arms between READY_ARM_POSE and a walk-buffer sample; arm_bias starts at 1.0 so the policy skips the "hands roughly toward box" discovery phase, then pick_curriculum ramps it to 0.0 for a realistic walk -> pick handoff.
-        "reset_arms_ready": EventTermCfg(
-            func=reset_arms_to_ready,
-            mode="reset",
-            params={"asset_cfg": arm_asset, "arm_bias": 1.0, "buffer_path": WALK_BUFFER_PATH},
-        ),
-        # Samples the 20-D command and writes the matching box spawn.
+        # Samples the 20-D command and writes the box spawn (always on the table).
         "reset_pick_cmd": EventTermCfg(
             func=reset_pick_command_and_object,
             mode="reset",
-            params={"scale": 0.30, "hand_bias": 1.0},   # both overwritten by pick_curriculum
+            params={},
         ),
         "push_robot": EventTermCfg(
             func=vel_mdp.push_by_setting_velocity,
@@ -1811,7 +1782,7 @@ def build_g1_pick_mdp():
             params={"sensor_name": body_table_contact_cfg.name,
                     "force_threshold": 5.0},
         ),
-        # "Grabbed but didn't squeeze": box ever 10 cm above the resting-on-table position and now within 3 cm of it; fires whether the box free-fell from hands or was lifted and dropped (min_step=30 grace covers the hand_bias=1.0 spawn free-fall).
+        # "Grabbed but didn't squeeze": box ever 10 cm above the resting-on-table position and now within 3 cm of it; fires whether the box slipped from hands or was lifted and dropped (min_step=30 grace covers early transient contacts at reset).
         "box_fell_back": TerminationTermCfg(
             func=box_fell_back,
             params={"box_cfg": box,
