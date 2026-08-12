@@ -708,9 +708,10 @@ def grip_force_reward(env, sensor_name: str = "hand_box_contact",
 
 
 def hand_approach_velocity_penalty(env, left_hand_cfg, right_hand_cfg, box_cfg,
-                                    gate_dist: float = 0.20):
-    """Penalise hand linear velocity when either hand is within gate_dist of the box, forcing a gentle approach; uses body_link_lin_vel_w to avoid the reset-spike bug.
-    Args: env — RL env; left_hand_cfg — left hand entity; right_hand_cfg — right hand entity; box_cfg — box entity; gate_dist — activation distance in metres.
+                                    gate_dist: float = 0.20,
+                                    w_lin: float = 1.0, w_ang: float = 0.0):
+    """Penalise hand linear (and optionally angular) velocity when either hand is within gate_dist of the box, forcing a gentle approach and folding the "whippy" wrist-flick mode into the same term so a fast rotational grip pays the same cost as a fast linear reach; uses body_link_*_vel_w to avoid the reset-spike bug.
+    Args: env — RL env; left_hand_cfg — left hand entity; right_hand_cfg — right hand entity; box_cfg — box entity; gate_dist — activation distance in metres; w_lin — weight on Σ‖v_hand‖; w_ang — weight on Σ‖ω_hand‖ (default 0 keeps the pre-2026-08-11 linear-only behaviour).
     Returns: (num_envs,) tensor summing both hand speeds when the gate fires.
     """
     lh_pos = _entity_pos(env, left_hand_cfg)
@@ -728,8 +729,42 @@ def hand_approach_velocity_penalty(env, left_hand_cfg, right_hand_cfg, box_cfg,
         env._hand_body_idx = (body_names.index(lh_name), body_names.index(rh_name))
     lv = robot.data.body_link_lin_vel_w[:, env._hand_body_idx[0]]
     rv = robot.data.body_link_lin_vel_w[:, env._hand_body_idx[1]]
-    speed = torch.linalg.norm(lv, dim=-1) + torch.linalg.norm(rv, dim=-1)
+    lin_speed = torch.linalg.norm(lv, dim=-1) + torch.linalg.norm(rv, dim=-1)
+    if w_ang > 0.0:
+        lw = robot.data.body_link_ang_vel_w[:, env._hand_body_idx[0]]
+        rw = robot.data.body_link_ang_vel_w[:, env._hand_body_idx[1]]
+        ang_speed = torch.linalg.norm(lw, dim=-1) + torch.linalg.norm(rw, dim=-1)
+        speed = w_lin * lin_speed + w_ang * ang_speed
+    else:
+        speed = w_lin * lin_speed
     return speed * close_gate
+
+
+def foot_slip_penalty(env, left_foot_cfg, right_foot_cfg,
+                      left_hand_cfg, right_hand_cfg, box_cfg,
+                      gate_near: float = 0.15, gate_far: float = 0.25):
+    """Penalise the sum of foot xy linear speeds squared, ramped in smoothly as the closer hand approaches the box so the signal is active precisely during the grasp phase. Replaces the previous foot-displacement termination: instead of killing the episode for a 6 cm slip (a cliff that dominated returns and produced high-variance gradients), this term shapes a soft, dense pressure against foot shuffling that fades as the hands leave the box — mirroring drop's airborne-gated walk_to_target ramp.
+    Args: env — RL env; left_foot_cfg — left foot entity (typically left_ankle_roll_link); right_foot_cfg — right foot entity; left_hand_cfg / right_hand_cfg — hand entities used for the phase gate; box_cfg — box entity; gate_near — closer-hand distance in metres at which the ramp saturates to 1; gate_far — closer-hand distance in metres at which the ramp reaches 0.
+    Returns: (num_envs,) tensor.
+    """
+    lh_pos = _entity_pos(env, left_hand_cfg)
+    rh_pos = _entity_pos(env, right_hand_cfg)
+    box_pos = _entity_pos(env, box_cfg)
+    dl = torch.linalg.norm(lh_pos - box_pos, dim=-1)
+    dr = torch.linalg.norm(rh_pos - box_pos, dim=-1)
+    min_dh = torch.minimum(dl, dr)
+    ramp = torch.clamp(1.0 - (min_dh - gate_near) / (gate_far - gate_near), 0.0, 1.0)
+
+    robot = env.scene["robot"]
+    body_names = list(robot.body_names)
+    if not hasattr(env, "_foot_body_idx"):
+        lf_name = left_foot_cfg.body_names[0] if isinstance(left_foot_cfg.body_names, (list, tuple)) else left_foot_cfg.body_names
+        rf_name = right_foot_cfg.body_names[0] if isinstance(right_foot_cfg.body_names, (list, tuple)) else right_foot_cfg.body_names
+        env._foot_body_idx = (body_names.index(lf_name), body_names.index(rf_name))
+    lv = robot.data.body_link_lin_vel_w[:, env._foot_body_idx[0], :2]
+    rv = robot.data.body_link_lin_vel_w[:, env._foot_body_idx[1], :2]
+    speed_sq = (lv ** 2).sum(dim=-1) + (rv ** 2).sum(dim=-1)
+    return speed_sq * ramp
 
 
 def palm_inward_bilateral_reward(env, left_hand_cfg, right_hand_cfg,
@@ -1439,6 +1474,18 @@ def pick_curriculum(env, env_ids):
         term_cfg.params["body_bias"] = body_bias
     except Exception:
         pass
+    # Ramp action_rate_l2 weight on the same schedule as body_bias: keep the base -3e-2 during the SQUAT_GRIP exploration window (step < 24k), then smoothstep down to -6e-2 as body_bias hands the robot realistic walk-poses. Starting the polish weight early crushed exploration in the prior cfea102 run.
+    try:
+        rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
+        base_w, target_w = -3.0e-2, -6.0e-2
+        if step < 24_000:
+            rt_cfg.weight = base_w
+        elif step < 96_000:
+            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep((step - 24_000) / (96_000 - 24_000))
+        else:
+            rt_cfg.weight = target_w
+    except Exception:
+        pass
     return {"pick_body_bias": body_bias}
 
 
@@ -1475,6 +1522,8 @@ def build_g1_pick_mdp():
     right_shank = SceneEntityCfg("robot", body_names=("right_knee_link",))
     left_hip    = SceneEntityCfg("robot", body_names=("left_hip_pitch_link",))
     right_hip   = SceneEntityCfg("robot", body_names=("right_hip_pitch_link",))
+    left_foot   = SceneEntityCfg("robot", body_names=("left_ankle_roll_link",))
+    right_foot  = SceneEntityCfg("robot", body_names=("right_ankle_roll_link",))
     box         = SceneEntityCfg("box")
 
     # Sensors mirrored from walk.
@@ -1669,11 +1718,19 @@ def build_g1_pick_mdp():
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
-        # Weight relaxed -3.0 -> -1.0: hands legitimately move fast near the box during a squeeze, and the stronger penalty was fighting the pick task (last run showed accumulated -1.59 growing throughout training).
+        # Weight relaxed -3.0 -> -1.0: hands legitimately move fast near the box during a squeeze, and the stronger penalty was fighting the pick task (last run showed accumulated -1.59 growing throughout training). w_ang=0.1 folds in wrist angular speed on 2026-08-11 to catch the "whippy" flick observed at eval — same trick drop used to fold angular into box_impact_vel, avoiding a separate reward term.
         "hand_approach_vel": RewardTermCfg(
             func=hand_approach_velocity_penalty, weight=-1.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "box_cfg": box, "gate_dist": 0.25},
+                    "box_cfg": box, "gate_dist": 0.25,
+                    "w_lin": 1.0, "w_ang": 0.1},
+        ),
+        # Soft, dense pressure against foot shuffling during grasp — replaces the cfea102 foot_displaced termination (cliff at 6 cm that produced high-variance returns). Weight -1.0 is intentionally modest; both feet at 0.5 m/s slip cost ~ -0.5/step so it competes with hand_approach_vel without freezing legs during approach.
+        "foot_slip": RewardTermCfg(
+            func=foot_slip_penalty, weight=-1.0,
+            params={"left_foot_cfg": left_foot, "right_foot_cfg": right_foot,
+                    "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "box_cfg": box, "gate_near": 0.15, "gate_far": 0.25},
         ),
         "dof_pos_limits": RewardTermCfg(func=vel_mdp.joint_pos_limits, weight=-1.0, params={"asset_cfg": g1_asset}),
         "base_ang_vel":   RewardTermCfg(func=base_ang_vel_penalty,     weight=-0.05),
