@@ -767,6 +767,36 @@ def foot_slip_penalty(env, left_foot_cfg, right_foot_cfg,
     return speed_sq * ramp
 
 
+def walk_to_box_bundle_reward(env, box_cfg, left_hand_cfg, right_hand_cfg,
+                               sigma: float = 1.0,
+                               w_target: float = 2.0, w_progress: float = 1.0,
+                               gate_near: float = 0.15, gate_far: float = 0.30):
+    """Fused walk-to-box (Gaussian on horizontal distance) and walk-progress (base velocity aligned with direction to box). Gated to zero once either hand is near the box so the reward stops incentivising forward motion during the grasp/lift phase — otherwise the policy is paid for pushing into the table. Mirrors drop's walk_to_target_bundle_reward.
+    Args: env — RL env; box_cfg — box entity; left/right_hand_cfg — hand entities used for the phase gate; sigma — Gaussian bandwidth in metres; w_target/w_progress — per-signal weights folded in; gate_near — closer-hand distance in metres at which the ramp reaches 0; gate_far — closer-hand distance in metres at which the ramp saturates to 1.
+    Returns: (num_envs,) tensor.
+    """
+    robot: Entity = env.scene["robot"]
+    root_pos = robot.data.root_link_pos_w
+    box_pos = _entity_pos(env, box_cfg)
+    delta = box_pos[:, :2] - root_pos[:, :2]
+    dist_full = torch.linalg.norm(delta, dim=-1)
+    target_r = torch.exp(-(dist_full ** 2) / (2.0 * sigma * sigma))
+    dist_clamped = dist_full.clamp(min=1e-4).unsqueeze(-1)
+    direction = delta / dist_clamped
+    lin_vel_w = robot.data.root_link_lin_vel_w[:, :2]
+    v_align = torch.sum(direction * lin_vel_w, dim=-1)
+    progress_r = torch.clamp(v_align, -1.5, 1.5)
+    bundle = w_target * target_r + w_progress * progress_r
+
+    lh_pos = _entity_pos(env, left_hand_cfg)
+    rh_pos = _entity_pos(env, right_hand_cfg)
+    dl = torch.linalg.norm(lh_pos - box_pos, dim=-1)
+    dr = torch.linalg.norm(rh_pos - box_pos, dim=-1)
+    min_dh = torch.minimum(dl, dr)
+    gate = torch.clamp((min_dh - gate_near) / (gate_far - gate_near), 0.0, 1.0)
+    return bundle * gate
+
+
 def palm_inward_bilateral_reward(env, left_hand_cfg, right_hand_cfg,
                                   left_palm_axis_local=(0.0, -1.0, 0.0),
                                   right_palm_axis_local=(0.0,  1.0, 0.0),
@@ -1477,7 +1507,7 @@ def pick_curriculum(env, env_ids):
     # Ramp action_rate_l2 weight on the same schedule as body_bias: keep the base -3e-2 during the SQUAT_GRIP exploration window (step < 24k), then smoothstep down to -6e-2 as body_bias hands the robot realistic walk-poses. Starting the polish weight early crushed exploration in the prior cfea102 run.
     try:
         rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
-        base_w, target_w = -3.0e-2, -6.0e-2
+        base_w, target_w = -1.0e-2, -2.0e-2
         if step < 24_000:
             rt_cfg.weight = base_w
         elif step < 96_000:
@@ -1706,14 +1736,14 @@ def build_g1_pick_mdp():
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
         ),
-        # Weight bumped -0.5 -> -2.0 to stop free arm jitter during the hold phase (at -0.5 the penalty was trivial vs +30 stability + +5 grip_force).
-        "stay_still":     RewardTermCfg(func=stay_still_penalty,    weight=-2.0,
+        # Softened -2.0 -> -0.3: at -2.0 this fought locomotion once body_bias -> 0 (post-curriculum regression in the 2026-08-11_21-59-46 run — reward collapsed from 144 to 90 as fell_over spiked to 15/iter). Kept nonzero for residual arm-jitter suppression during hold.
+        "stay_still":     RewardTermCfg(func=stay_still_penalty,    weight=-0.3,
                                         params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                                                 "box_cfg": box, "gate_dist": 0.20}),
         "symmetric_pose": RewardTermCfg(func=symmetric_pose_penalty, weight=-0.3,
                                         params={"left_cfg": left_sym, "right_cfg": right_sym}),
-        # ETH ANYmal-style smoothness bundle: action_rate at -3e-2 (was -3.0, 300× the Rudin/Miki/Hwangbo scale, masking the missing dof_acc); action_rate/dof_vel bumped -1e-2 -> -3e-2 and -1e-3 -> -5e-3 to kill the arm oscillation seen while holding the box aloft.
-        "action_rate_l2": RewardTermCfg(func=action_rate_l2,           weight=-3.0e-2),
+        # Relaxed -3e-2 -> -1e-2: at -3e-2 the penalty starved corrective foot steps during the approach phase once body_bias -> 0. Curriculum ramp target below scaled proportionally (-6e-2 -> -2e-2) so the polish stage still bites.
+        "action_rate_l2": RewardTermCfg(func=action_rate_l2,           weight=-1.0e-2),
         # Second-order (jerk) term: |a_t − 2a_{t−1} + a_{t−2}|².
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
@@ -1732,6 +1762,13 @@ def build_g1_pick_mdp():
                     "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "box_cfg": box, "gate_near": 0.15, "gate_far": 0.25},
         ),
+        # Locomotion shaping: Gaussian on horizontal robot->box distance + progress on base velocity aligned with the delta. Gated OFF as the closer hand approaches the box (mirror of foot_slip's gate, inverted) so the term dies during grasp/lift. Missing in the 2026-08-11_21-59-46 run — hand_placement alone was too weak to drag the robot across the table once body_bias -> 0.
+        "walk_to_box": RewardTermCfg(
+            func=walk_to_box_bundle_reward, weight=1.0,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "sigma": 1.0, "w_target": 2.0, "w_progress": 1.0,
+                    "gate_near": 0.15, "gate_far": 0.30},
+        ),
         "dof_pos_limits": RewardTermCfg(func=vel_mdp.joint_pos_limits, weight=-1.0, params={"asset_cfg": g1_asset}),
         "base_ang_vel":   RewardTermCfg(func=base_ang_vel_penalty,     weight=-0.05),
         # Contact penalties.
@@ -1747,9 +1784,9 @@ def build_g1_pick_mdp():
                     "left_hand_cfg": left_hand, "right_hand_cfg": right_hand, "box_cfg": box,
                     "w_non_hand_box": -2.0, "w_body_table": -2.0},
         ),
-        # Explicit fall penalty at -50/step over the first 30 steps — termination alone lost to the "throw-yourself-backwards to collect box_carry_pose free lunch" attractor (ep=9, reward<10 before this term).
+        # Softened -50 -> -10: the -50 spike injected high-variance value targets that destabilised the critic once curriculum forced walking (see 2026-08-11_21-59-46 regression). Termination itself still cuts the trajectory; -10 keeps the "throw-yourself-backwards" attractor unattractive without dominating advantage estimates.
         "fell_over_penalty": RewardTermCfg(
-            func=fell_over_penalty, weight=-50.0,
+            func=fell_over_penalty, weight=-10.0,
             params={"trunk_cfg": trunk, "tilt_threshold": 0.5, "early_steps": 30},
         ),
     }
