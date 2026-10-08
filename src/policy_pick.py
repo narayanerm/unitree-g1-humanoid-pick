@@ -1397,7 +1397,7 @@ def reset_from_walk_buffer(
     Returns: none.
     """
     from mjlab.utils.lab_api.math import (
-        quat_from_euler_xyz, quat_mul, sample_uniform,
+        quat_apply, quat_from_euler_xyz, quat_mul, sample_uniform,
     )
 
     if env_ids is None:
@@ -1416,6 +1416,14 @@ def reset_from_walk_buffer(
     walk_z     = buf["root_z"][idx]                    # (n,) or (n, 1)
     walk_quat  = buf["quat_zy"][idx]                   # (n, 4)
     walk_joint = buf["joint_pos"][idx]                 # (n, 29) in G1_JOINTS order
+    # Walk-terminal residual momentum: lin/ang vel are stored in the sample's
+    # yaw-aligned body frame (quat_zy strips yaw), so re-rotate them by the
+    # reset's final yaw further below. joint_vel is frame-agnostic. Legacy
+    # buffers that pre-date collect_buffer's velocity dump keep working via
+    # the None branches at the velocity lerp.
+    walk_lin_vel_by = buf["lin_vel_by"][idx] if "lin_vel_by" in buf else None
+    walk_ang_vel_by = buf["ang_vel_by"][idx] if "ang_vel_by" in buf else None
+    walk_joint_vel  = buf["joint_vel"][idx]  if "joint_vel"  in buf else None
 
     # SQUAT_GRIP end of the interpolation.
     squat_joint = torch.tensor(
@@ -1438,11 +1446,6 @@ def reset_from_walk_buffer(
         root_quat_base, dim=-1, keepdim=True,
     ).clamp(min=1e-6)
 
-    # Zero velocities at reset: inherit posture without inertia (residual base/joint velocities used to catapult the robot into unrecoverable tilts).
-    joint_vel = torch.zeros_like(joint_pos)
-    lin_vel = torch.zeros(n, 3, device=device)
-    ang_vel = torch.zeros(n, 3, device=device)
-
     # Scale jitter by (1 - body_bias) so squat mode spawns the robot deterministically in front of the box (facing +x, at SQUAT_GRIP_ROOT_POS xy) and walk mode keeps the full DR range.
     jitter_scale = 1.0 - bb
     xy_jitter = sample_uniform(xy_range[0] * jitter_scale, xy_range[1] * jitter_scale, (n, 2), device=device)
@@ -1450,6 +1453,20 @@ def reset_from_walk_buffer(
     zero = torch.zeros_like(yaw_jitter)
     q_yaw = quat_from_euler_xyz(zero, zero, yaw_jitter)
     root_quat = quat_mul(q_yaw, root_quat_base)
+
+    # Velocity lerp: at bb=1 the robot inherits SQUAT_GRIP posture without inertia (zeros); at bb=0 it carries walk-terminal residual momentum (base ang_vel ~1 rad/s, joint_vel norm ~7). The prior zero-velocity reset trained the pick on a manifold the FSM handover never reaches, so the walk->pick transition shocked the policy out of its support (measured on a 2000-ep monolithic dataset: 87% of fallen episodes dropped within 1.6 s of handover, with median base ang_vel 1.33 rad/s vs training's zero-plus-DR-push cap of 0.78 rad/s). Re-rotate base velocities from the walk sample's yaw-aligned frame into the reset's world yaw (quat_zy has yaw=0, so q_yaw is the only yaw component left in root_quat); joint_vel is already body-local and frame-agnostic.
+    if walk_lin_vel_by is not None and walk_ang_vel_by is not None:
+        walk_lin_vel_w = quat_apply(q_yaw, walk_lin_vel_by)
+        walk_ang_vel_w = quat_apply(q_yaw, walk_ang_vel_by)
+        lin_vel = (1.0 - bb) * walk_lin_vel_w
+        ang_vel = (1.0 - bb) * walk_ang_vel_w
+    else:
+        lin_vel = torch.zeros(n, 3, device=device)
+        ang_vel = torch.zeros(n, 3, device=device)
+    if walk_joint_vel is not None:
+        joint_vel = (1.0 - bb) * walk_joint_vel
+    else:
+        joint_vel = torch.zeros_like(joint_pos)
 
     asset: Entity = env.scene[asset_cfg.name]
     default_root_state = asset.data.default_root_state[env_ids].clone()
