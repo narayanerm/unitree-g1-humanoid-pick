@@ -1,8 +1,8 @@
-###############################################################################
-# Project    : Humanoid Loco-Manipulation with the Unitree G1                 #
-# Developer  : Narayane Ribeiro Medeiros                                      #
-# Repository : https://github.com/narayanerm/Humanoid-Loco-Manipulation       #
-###############################################################################
+##########################################################################################
+# Project    : unitree-g1-humanoid-pick                                                  #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-pick                    #
+##########################################################################################
 """PPO training loop with shape-filtered warm-start, progressive unfreeze, and trunk-frozen diagnostic.
 
 Input:  task_id, cfg (num_envs, max_iters, ...), log_dir, optional warm_start_ckpt or resume_ckpt.
@@ -22,14 +22,14 @@ import torch
 
 def warm_start_shape_filtered(runner, ckpt_path: str | Path) -> None:
     """Load actor and critic weights from a checkpoint, copying only shape-matching tensors.
-    Args: runner — mjlab runner; ckpt_path — source checkpoint path.
+    Args: runner: mjlab runner; ckpt_path: source checkpoint path.
     Returns: none.
     """
     loaded = torch.load(str(ckpt_path), map_location=runner.device, weights_only=False)
 
     def _apply(source_sd: dict, dest_module, tag: str) -> None:
         """Copy tensors from source_sd into dest_module when shapes match.
-        Args: source_sd — source state dict; dest_module — target nn.Module; tag — log label.
+        Args: source_sd: source state dict; dest_module: target nn.Module; tag: log label.
         Returns: none.
         """
         dest_sd = dest_module.state_dict()
@@ -63,7 +63,7 @@ def warm_start_shape_filtered(runner, ckpt_path: str | Path) -> None:
 
 def _mean_reward(runner) -> Optional[float]:
     """Compute mean of the rsl_rl 100-episode reward buffer.
-    Args: runner — mjlab runner exposing logger.rewbuffer.
+    Args: runner: mjlab runner exposing logger.rewbuffer.
     Returns: mean reward as float, or None if the buffer is empty.
     """
     buf = getattr(getattr(runner, "logger", None), "rewbuffer", None)
@@ -80,7 +80,7 @@ def _train_with_early_stop(
     min_improve: float,
 ) -> None:
     """Train iteration-by-iteration and stop when the moving-average reward plateaus.
-    Args: runner — mjlab runner; max_iters — cap on iterations; patience — stagnant iters tolerated; window — moving-average length; min_improve — relative gain threshold.
+    Args: runner: mjlab runner; max_iters: cap on iterations; patience: stagnant iters tolerated; window: moving-average length; min_improve: relative gain threshold.
     Returns: none.
     """
     history: list[float] = []
@@ -108,7 +108,7 @@ def _train_with_early_stop(
 
 def _freeze_actor(runner, freeze: bool) -> None:
     """Toggle requires_grad on every actor parameter (legacy critic-warmup path).
-    Args: runner — mjlab runner; freeze — True to freeze, False to unfreeze.
+    Args: runner: mjlab runner; freeze: True to freeze, False to unfreeze.
     Returns: none.
     """
     for p in runner.alg.actor.parameters():
@@ -126,7 +126,7 @@ _DEFAULT_UNFREEZE_SCHEDULE = {
 
 def _set_actor_layers_frozen(runner, unfrozen_layers: set[int]) -> None:
     """Freeze actor.mlp layers outside unfrozen_layers while keeping normalizer and distribution trainable.
-    Args: runner — mjlab runner; unfrozen_layers — set of mlp indices to keep trainable.
+    Args: runner: mjlab runner; unfrozen_layers: set of mlp indices to keep trainable.
     Returns: none.
     """
     for name, p in runner.alg.actor.named_parameters():
@@ -143,7 +143,7 @@ def _run_progressive_unfreeze(
     schedule: dict[int, set[int]] | None = None,
 ) -> None:
     """Run PPO while progressively unfreezing actor layers per a step schedule.
-    Args: runner — mjlab runner; max_iters — total learning iterations; schedule — {start_iter: unfrozen mlp indices} (default if None).
+    Args: runner: mjlab runner; max_iters: total learning iterations; schedule: {start_iter: unfrozen mlp indices} (default if None).
     Returns: none.
     """
     schedule = schedule or _DEFAULT_UNFREEZE_SCHEDULE
@@ -170,7 +170,7 @@ def _run_progressive_unfreeze(
 
 def _apply_trunk_frozen_diagnostic(runner) -> None:
     """Freeze walk-trunk layers (mlp.2, mlp.4) and swap the head for Linear->ELU->Linear.
-    Args: runner — mjlab runner whose actor has an mlp trunk of depth >= 6.
+    Args: runner: mjlab runner whose actor has an mlp trunk of depth >= 6.
     Returns: none.
     """
     import torch.nn as nn
@@ -221,7 +221,7 @@ def run(
     diagnostic_trunk_frozen: bool = False,
 ) -> None:
     """Entrypoint for PPO training with warm-start, resume, progressive unfreeze, and diagnostic modes.
-    Args: task_id — mjlab task id; cfg — TrainConfig (env, agent, ...); log_dir — output dir; warm_start_ckpt — optional shape-filtered source ckpt; resume_ckpt — optional identical-shape resume ckpt (exclusive with warm_start_ckpt); reset_std — after resume, force the actor's Gaussian std to this scalar (typical: 1.0 to recover a stalled/blown-up std); early_stopping/patience/window/min_improve — plateau-stop controls; critic_warmup_iters — legacy freeze-actor duration (0 uses progressive unfreeze); diagnostic_trunk_frozen — freeze mlp.2/mlp.4 and swap head (requires warm_start_ckpt).
+    Args: task_id: mjlab task id; cfg: TrainConfig (env, agent, ...); log_dir: output dir; warm_start_ckpt: optional shape-filtered source ckpt; resume_ckpt: optional identical-shape resume ckpt (exclusive with warm_start_ckpt); reset_std: after resume, force the actor's Gaussian std to this scalar (typical: 1.0 to recover a stalled/blown-up std); early_stopping/patience/window/min_improve: plateau-stop controls; critic_warmup_iters: legacy freeze-actor duration (0 uses progressive unfreeze); diagnostic_trunk_frozen: freeze mlp.2/mlp.4 and swap head (requires warm_start_ckpt).
     Returns: none.
     """
     from mjlab.envs import ManagerBasedRlEnv
@@ -248,18 +248,8 @@ def run(
     runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
     runner = runner_cls(env, agent_cfg, str(log_dir), device)
 
-    # Optional PPO mirror data augmentation: if the task's policy module defines
-    # SYMMETRY_CFG, wire it into runner.alg.symmetry. Skipped silently otherwise.
-    try:
-        from src import policy_pick as _pick_mod
-        if hasattr(_pick_mod, "SYMMETRY_CFG"):
-            runner.alg.symmetry = dict(_pick_mod.SYMMETRY_CFG)
-            runner.alg.symmetry["_env"] = env
-            print(f"[symmetry] enabled: use_data_augmentation="
-                  f"{runner.alg.symmetry['use_data_augmentation']}, "
-                  f"use_mirror_loss={runner.alg.symmetry['use_mirror_loss']}")
-    except ImportError:
-        pass
+    # Mirror data augmentation is wired via policy_pick.g1_pick_ppo_runner_cfg().algorithm.symmetry_cfg,
+    # which rsl_rl's PPO.__init__ resolves (string -> callable) during runner construction above.
 
     if resume_ckpt is not None:
         print(f"[INFO] Resuming from: {resume_ckpt}")
@@ -278,7 +268,7 @@ def run(
                     new_mean = float(dist.log_std_param.exp().mean().item())
                 else:
                     raise AttributeError(
-                        "Actor distribution has no std_param/log_std_param — cannot reset std."
+                        "Actor distribution has no std_param/log_std_param: cannot reset std."
                     )
             print(f"[INFO] Reset policy std to {reset_std:.3f} (verified mean std={new_mean:.3f}).")
     elif warm_start_ckpt is not None:
