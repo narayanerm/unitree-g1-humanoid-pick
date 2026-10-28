@@ -45,6 +45,7 @@ from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.velocity import mdp as vel_mdp
 from mjlab.tasks.velocity.mdp import base_ang_vel, base_lin_vel, projected_gravity
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse, quat_conjugate, quat_mul, yaw_quat
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
@@ -324,42 +325,51 @@ def body_vector(env, source_cfg, target_cfg):
     return _entity_pos(env, target_cfg) - _entity_pos(env, source_cfg)
 
 
+def _base_yaw_quat_w(env) -> torch.Tensor:
+    """Robot base orientation projected onto yaw, as (num_envs, 4) wxyz. Rotating a world vector by its inverse yields the body-yaw frame used by mirror_pick_obs.
+    """
+    return yaw_quat(env.scene["robot"].data.root_link_quat_w)
+
+
 # Box signals sanitized so MuJoCo divergences never trip rsl_rl.check_nan.
 def box_position_obs(env, box_cfg):
-    """Box position relative to the robot base, sanitized and clamped.
+    """Robot-to-box offset in body-yaw frame, sanitized and clamped.
     Args: env: the RL env; box_cfg: scene entity config for the box.
     Returns: (num_envs, 3) tensor.
     """
     box_pos = env.scene[box_cfg.name].data.root_link_pos_w
     robot_pos = env.scene["robot"].data.root_link_pos_w
-    rel = box_pos - robot_pos
+    rel = quat_apply_inverse(_base_yaw_quat_w(env), box_pos - robot_pos)
     return torch.nan_to_num(rel, nan=0.0, posinf=0.0, neginf=0.0).clamp(-3.0, 3.0)
 
 
 def box_lin_vel_obs(env, box_cfg):
-    """Box linear velocity in world frame, sanitized and clamped.
+    """Box linear velocity in body-yaw frame, sanitized and clamped.
     Args: env: the RL env; box_cfg: scene entity config for the box.
     Returns: (num_envs, 3) tensor.
     """
     v = env.scene[box_cfg.name].data.root_link_lin_vel_w
+    v = quat_apply_inverse(_base_yaw_quat_w(env), v)
     return torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0).clamp(-5.0, 5.0)
 
 
 def box_ang_vel_obs(env, box_cfg):
-    """Box angular velocity in world frame, sanitized and clamped.
+    """Box angular velocity in body-yaw frame, sanitized and clamped.
     Args: env: the RL env; box_cfg: scene entity config for the box.
     Returns: (num_envs, 3) tensor.
     """
     w = env.scene[box_cfg.name].data.root_link_ang_vel_w
+    w = quat_apply_inverse(_base_yaw_quat_w(env), w)
     return torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0).clamp(-10.0, 10.0)
 
 
 def box_orientation_obs(env, box_cfg):
-    """Box orientation quaternion in world frame, sanitized and clamped.
+    """Box orientation quaternion in body-yaw frame, sanitized and clamped.
     Args: env: the RL env; box_cfg: scene entity config for the box.
     Returns: (num_envs, 4) tensor.
     """
     q = env.scene[box_cfg.name].data.root_link_quat_w
+    q = quat_mul(quat_conjugate(_base_yaw_quat_w(env)), q)
     return torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
 
 
@@ -485,14 +495,13 @@ def reset_pick_command_and_object(
 
 
 def _pos_in_base_frame(env: ManagerBasedRlEnv, world_pos: torch.Tensor) -> torch.Tensor:
-    """Transform a world-frame position tensor to the robot base frame.
+    """Transform a world-frame position tensor to the robot's body-yaw frame to match the frame used by every other box/cmd obs (consistent with mirror_pick_obs's y-flip semantics).
     Args: env: the RL env; world_pos: (num_envs, 3) tensor of world positions.
-    Returns: (num_envs, 3) tensor in base frame.
+    Returns: (num_envs, 3) tensor in body-yaw frame.
     """
-    from mjlab.utils.lab_api.math import quat_apply_inverse
     robot: Entity = env.scene["robot"]
     delta = world_pos - robot.data.root_link_pos_w
-    return quat_apply_inverse(robot.data.root_link_quat_w, delta)
+    return quat_apply_inverse(_base_yaw_quat_w(env), delta)
 
 
 def cmd_grasp_offset_left_obs(env):
@@ -523,12 +532,13 @@ def cmd_object_target_pos_obs(env):
 
 
 def cmd_object_target_quat_obs(env):
-    """Object-target orientation quaternion in world frame.
+    """Object-target orientation quaternion in body-yaw frame.
     Args: env: the RL env.
     Returns: (num_envs, 4) tensor.
     """
     _ensure_cmd_buffers(env)
-    return env.extras[_CMD_KEY + "object_target_quat"]
+    q = env.extras[_CMD_KEY + "object_target_quat"]
+    return quat_mul(quat_conjugate(_base_yaw_quat_w(env)), q)
 
 
 def cmd_lift_target_pos_obs(env):
@@ -541,12 +551,13 @@ def cmd_lift_target_pos_obs(env):
 
 
 def cmd_lift_target_quat_obs(env):
-    """Lift-target orientation quaternion in world frame.
+    """Lift-target orientation quaternion in body-yaw frame.
     Args: env: the RL env.
     Returns: (num_envs, 4) tensor.
     """
     _ensure_cmd_buffers(env)
-    return env.extras[_CMD_KEY + "lift_target_quat"]
+    q = env.extras[_CMD_KEY + "lift_target_quat"]
+    return quat_mul(quat_conjugate(_base_yaw_quat_w(env)), q)
 
 
 # Fixed side-face grasp target that forces wrist-pinching geometry: left wrist targets +y face, right wrist targets -y face; deterministic (no per-episode jitter) so the policy converges to the pinch pose.
@@ -1583,11 +1594,17 @@ def pick_curriculum(env, env_ids):
             env._pick_curriculum_step = 0
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
-    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 -> 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses.
-    if step < 24_000:
+    # Staggered curriculum: previous schedule ramped body_bias, box_lift_vel and action_rate_l2 together between step 24k and 96k, which coincided with Loss/value exploding 16x and reward collapsing from +145 to +40. The critic cannot fit three simultaneous MDP shifts (reset distribution + new reward term + weight increase). Each shift now owns its own window with a 24k-step hold between for the critic to re-calibrate before the next change. Phase A warmup is unchanged; the full ramp finishes at step 144k (PPO iter 6000 at 24 steps/iter, 8192 envs).
+    A_END = 24_000   # SQUAT_GRIP warmup end
+    B_END = 72_000   # body_bias ramp end
+    C_END = 96_000   # critic settle (hold) end
+    D_END = 120_000  # box_lift_vel ramp end
+    E_END = 144_000  # action_rate_l2 ramp end
+    # Phase B: body_bias 1.0 -> 0.0 (48k-step window; wider than the previous 72k shared window because this is the only ramp running here).
+    if step < A_END:
         body_bias = 1.0
-    elif step < 96_000:
-        body_bias = 1.0 - _smoothstep((step - 24_000) / (96_000 - 24_000))
+    elif step < B_END:
+        body_bias = 1.0 - _smoothstep((step - A_END) / (B_END - A_END))
     else:
         body_bias = 0.0
     try:
@@ -1595,37 +1612,31 @@ def pick_curriculum(env, env_ids):
         term_cfg.params["body_bias"] = body_bias
     except Exception:
         pass
-    # Ramp action_rate_l2 weight on the same schedule as body_bias: keep the base -3e-2 during the SQUAT_GRIP exploration window (step < 24k), then smoothstep down to -6e-2 as body_bias hands the robot realistic walk-poses. Starting the polish weight early crushed exploration in the prior cfea102 run.
+    # Phase D: box_lift_vel 0 -> -6.0. Starts only after body_bias is at 0.0 and the critic has had 24k steps (phase C) to settle on the new reset distribution.
+    blv_target = -6.0
+    if step < C_END:
+        box_lift_vel_w = 0.0
+    elif step < D_END:
+        box_lift_vel_w = blv_target * _smoothstep((step - C_END) / (D_END - C_END))
+    else:
+        box_lift_vel_w = blv_target
     try:
-        rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
-        base_w, target_w = -1.0e-2, -2.0e-2
-        if step < 24_000:
-            rt_cfg.weight = base_w
-        elif step < 96_000:
-            rt_cfg.weight = base_w + (target_w - base_w) * _smoothstep((step - 24_000) / (96_000 - 24_000))
-        else:
-            rt_cfg.weight = target_w
+        env.reward_manager.get_term_cfg("box_lift_vel").weight = box_lift_vel_w
     except Exception:
         pass
-    # Ramp box_lift_vel weight on the same schedule: 0 during the SQUAT_GRIP exploration window (step < 24k, so the policy can freely experiment with lift dynamics from the ideal start), then smoothstep to -6.0 as body_bias hands the robot realistic walk-poses. Reaching full strength at the same point action_rate_l2 does keeps the two smoothness pressures phased together.
+    # Phase E: action_rate_l2 -1e-2 -> -2e-2. Last to ramp because it is the smoothness polish term and only matters once the task is already being solved.
+    rt_base, rt_target = -1.0e-2, -2.0e-2
+    if step < D_END:
+        rt_w = rt_base
+    elif step < E_END:
+        rt_w = rt_base + (rt_target - rt_base) * _smoothstep((step - D_END) / (E_END - D_END))
+    else:
+        rt_w = rt_target
     try:
-        blv_cfg = env.reward_manager.get_term_cfg("box_lift_vel")
-        blv_target = -6.0
-        if step < 24_000:
-            blv_cfg.weight = 0.0
-        elif step < 96_000:
-            blv_cfg.weight = blv_target * _smoothstep((step - 24_000) / (96_000 - 24_000))
-        else:
-            blv_cfg.weight = blv_target
+        env.reward_manager.get_term_cfg("action_rate_l2").weight = rt_w
     except Exception:
         pass
-    box_lift_vel_w = 0.0
-    if step >= 24_000:
-        if step < 96_000:
-            box_lift_vel_w = -6.0 * _smoothstep((step - 24_000) / (96_000 - 24_000))
-        else:
-            box_lift_vel_w = -6.0
-    return {"pick_body_bias": body_bias, "pick_box_lift_vel_w": box_lift_vel_w}
+    return {"pick_body_bias": body_bias, "pick_box_lift_vel_w": box_lift_vel_w, "pick_action_rate_w": rt_w}
 
 
 # MDP assembly.
