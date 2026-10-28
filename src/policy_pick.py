@@ -68,6 +68,8 @@ SNAPSHOT_ENTITIES = ["robot", "box"]
 SNAPSHOT_YAW_ALIGN = True
 
 # Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). Match the walk task's config: use_data_augmentation only (PPO converges to equivariance naturally when the reward is symmetric). Enabling use_mirror_loss on top added a second gradient that fought PPO and produced a biased fixed point in the carry training (visible spine tilt + asymmetric elbows).
+# Toggle for the whole mirror augmentation pipeline. When False, g1_pick_ppo_runner_cfg() passes symmetry_cfg=None so rsl_rl skips the augmentation path entirely (no mirror obs/action pass, no extra forward).
+USE_MIRROR_AUGMENTATION = False
 SYMMETRY_CFG = {
     "use_data_augmentation": True,
     "use_mirror_loss": False,
@@ -2100,7 +2102,7 @@ def g1_pick_ppo_runner_cfg():
             entropy_coef=0.001,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
             gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
-            symmetry_cfg=SYMMETRY_CFG,
+            symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,
         ),
         clip_actions=3.0,
         experiment_name="g1_pick", save_interval=50, num_steps_per_env=24,
