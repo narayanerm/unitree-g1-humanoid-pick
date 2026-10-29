@@ -1840,11 +1840,18 @@ def build_g1_pick_mdp():
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
-        # Era-4a value. Softened to -0.3 later because box_lift_vel took over the slow-motion pressure during the lift; with box_lift_vel removed from the reward dict, this term is the only penalty on upper-body velocity across the entire approach + lift, so it stays at -1.0.
+        # Bumped -1.0 -> -3.0 to match drop's hand_approach_vel weight. The 2026-10-29_01-41-39 run converged with mean_std=0.96 and visibly snappy hand descents; drop's -3.0 setting produces controlled approach without freezing the arm. Paired with box_lift_vel so the policy has two concurrent pressures on upper-body speed during the grasp->lift segment.
         "hand_approach_vel": RewardTermCfg(
-            func=hand_approach_velocity_penalty, weight=-1.0,
+            func=hand_approach_velocity_penalty, weight=-3.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "box_cfg": box, "gate_dist": 0.25,
+                    "w_lin": 1.0, "w_ang": 0.1},
+        ),
+        # Mirror of drop's box_impact_velocity_penalty, re-enabled after the 2026-10-29_01-41-39 run shipped without it. Penalises box |v|^2 during ascent (0 -> gate_z m), double-gated by both hands at the pinch anchors so numerical jitter at rest never fires it. Weight -4.0 vs drop's -6.0 on impact: lifting is lower-stakes than landing (no table collision cliff), so a lighter pull still shapes a controlled climb without starving lift_progress.
+        "box_lift_vel": RewardTermCfg(
+            func=box_lift_velocity_penalty, weight=-4.0,
+            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "gate_z": 0.35, "hold_dist": 0.15,
                     "w_lin": 1.0, "w_ang": 0.1},
         ),
         # Soft, dense pressure against foot shuffling during grasp: replaces the cfea102 foot_displaced termination (cliff at 6 cm that produced high-variance returns). Weight -1.0 is intentionally modest; both feet at 0.5 m/s slip cost ~ -0.5/step so it competes with hand_approach_vel without freezing legs during approach.
@@ -2062,9 +2069,9 @@ def g1_pick_ppo_runner_cfg():
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
-            entropy_coef=0.001,
+            entropy_coef=5e-4,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
-            gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
+            gamma=0.99, lam=0.95, desired_kl=0.005, max_grad_norm=1.0,
             symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,
         ),
         clip_actions=3.0,
