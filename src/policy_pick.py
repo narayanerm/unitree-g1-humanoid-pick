@@ -69,7 +69,7 @@ SNAPSHOT_YAW_ALIGN = True
 
 # Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). Match the walk task's config: use_data_augmentation only (PPO converges to equivariance naturally when the reward is symmetric). Enabling use_mirror_loss on top added a second gradient that fought PPO and produced a biased fixed point in the carry training (visible spine tilt + asymmetric elbows).
 # Toggle for the whole mirror augmentation pipeline. When False, g1_pick_ppo_runner_cfg() passes symmetry_cfg=None so rsl_rl skips the augmentation path entirely (no mirror obs/action pass, no extra forward).
-USE_MIRROR_AUGMENTATION = False
+USE_MIRROR_AUGMENTATION = True
 SYMMETRY_CFG = {
     "use_data_augmentation": True,
     "use_mirror_loss": False,
@@ -1596,17 +1596,11 @@ def pick_curriculum(env, env_ids):
             env._pick_curriculum_step = 0
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
-    # Staggered curriculum: previous schedule ramped body_bias, box_lift_vel and action_rate_l2 together between step 24k and 96k, which coincided with Loss/value exploding 16x and reward collapsing from +145 to +40. The critic cannot fit three simultaneous MDP shifts (reset distribution + new reward term + weight increase). Each shift now owns its own window with a 24k-step hold between for the critic to re-calibrate before the next change. Phase A warmup is unchanged; the full ramp finishes at step 144k (PPO iter 6000 at 24 steps/iter, 8192 envs).
-    A_END = 24_000   # SQUAT_GRIP warmup end
-    B_END = 72_000   # body_bias ramp end
-    C_END = 96_000   # critic settle (hold) end
-    D_END = 120_000  # box_lift_vel ramp end
-    E_END = 144_000  # action_rate_l2 ramp end
-    # Phase B: body_bias 1.0 -> 0.0 (48k-step window; wider than the previous 72k shared window because this is the only ramp running here).
-    if step < A_END:
+    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 -> 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses. No weight ramps on box_lift_vel or action_rate_l2: those stay at their constant reward-dict values so the only time-varying MDP shift is the reset distribution.
+    if step < 24_000:
         body_bias = 1.0
-    elif step < B_END:
-        body_bias = 1.0 - _smoothstep((step - A_END) / (B_END - A_END))
+    elif step < 96_000:
+        body_bias = 1.0 - _smoothstep((step - 24_000) / (96_000 - 24_000))
     else:
         body_bias = 0.0
     try:
@@ -1614,31 +1608,7 @@ def pick_curriculum(env, env_ids):
         term_cfg.params["body_bias"] = body_bias
     except Exception:
         pass
-    # Phase D: box_lift_vel 0 -> -6.0. Starts only after body_bias is at 0.0 and the critic has had 24k steps (phase C) to settle on the new reset distribution.
-    blv_target = -6.0
-    if step < C_END:
-        box_lift_vel_w = 0.0
-    elif step < D_END:
-        box_lift_vel_w = blv_target * _smoothstep((step - C_END) / (D_END - C_END))
-    else:
-        box_lift_vel_w = blv_target
-    try:
-        env.reward_manager.get_term_cfg("box_lift_vel").weight = box_lift_vel_w
-    except Exception:
-        pass
-    # Phase E: action_rate_l2 -1e-2 -> -2e-2. Last to ramp because it is the smoothness polish term and only matters once the task is already being solved.
-    rt_base, rt_target = -1.0e-2, -2.0e-2
-    if step < D_END:
-        rt_w = rt_base
-    elif step < E_END:
-        rt_w = rt_base + (rt_target - rt_base) * _smoothstep((step - D_END) / (E_END - D_END))
-    else:
-        rt_w = rt_target
-    try:
-        env.reward_manager.get_term_cfg("action_rate_l2").weight = rt_w
-    except Exception:
-        pass
-    return {"pick_body_bias": body_bias, "pick_box_lift_vel_w": box_lift_vel_w, "pick_action_rate_w": rt_w}
+    return {"pick_body_bias": body_bias}
 
 
 # MDP assembly.
@@ -1864,24 +1834,17 @@ def build_g1_pick_mdp():
                                                 "box_cfg": box, "gate_dist": 0.20}),
         "symmetric_pose": RewardTermCfg(func=symmetric_pose_penalty, weight=-0.3,
                                         params={"left_cfg": left_sym, "right_cfg": right_sym}),
-        # Relaxed -3e-2 -> -1e-2: at -3e-2 the penalty starved corrective foot steps during the approach phase once body_bias -> 0. Curriculum ramp target below scaled proportionally (-6e-2 -> -2e-2) so the polish stage still bites.
-        "action_rate_l2": RewardTermCfg(func=action_rate_l2,           weight=-1.0e-2),
+        # Era-4a value. Earlier run (2026-08-11_21-59-46) at this weight starved corrective foot steps once body_bias -> 0, which is why the parallel-curriculum era softened to -1e-2. Reverted here to isolate body_bias as the only curriculum variable; watch Episode_Termination/fell_over for the regression.
+        "action_rate_l2": RewardTermCfg(func=action_rate_l2,           weight=-3.0e-2),
         # Second-order (jerk) term: |a_t - 2a_{t-1} + a_{t-2}|^2.
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
-        # Weight softened -1.0 -> -0.3 after box_lift_vel took over the "slow motion" pressure. hand_approach_vel now only handles the pre-contact reach (fast whip toward the box on empty hands); once both hands touch, box_lift_vel dominates and covers upper-body speed via the box itself.
+        # Era-4a value. Softened to -0.3 later because box_lift_vel took over the slow-motion pressure during the lift; with box_lift_vel removed from the reward dict, this term is the only penalty on upper-body velocity across the entire approach + lift, so it stays at -1.0.
         "hand_approach_vel": RewardTermCfg(
-            func=hand_approach_velocity_penalty, weight=-0.3,
+            func=hand_approach_velocity_penalty, weight=-1.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "box_cfg": box, "gate_dist": 0.25,
-                    "w_lin": 1.0, "w_ang": 0.1},
-        ),
-        # Ported from place's box_impact_velocity_penalty (commit b788888): since the box is in the hands during the lift, speed(box) ~= speed(hands) ~= speed(torso), so a single penalty on the object folds "slow torso", "no arm snap", "no post-lift oscillation", and "no wrist flick" into one term. Gated on hands-near-anchors so numerical box jitter at rest isn't penalised. Weight is ramped in by pick_curriculum after step 24k to protect the SQUAT_GRIP exploration window.
-        "box_lift_vel": RewardTermCfg(
-            func=box_lift_velocity_penalty, weight=0.0,
-            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "gate_z": 0.35, "hold_dist": 0.15,
                     "w_lin": 1.0, "w_ang": 0.1},
         ),
         # Soft, dense pressure against foot shuffling during grasp: replaces the cfea102 foot_displaced termination (cliff at 6 cm that produced high-variance returns). Weight -1.0 is intentionally modest; both feet at 0.5 m/s slip cost ~ -0.5/step so it competes with hand_approach_vel without freezing legs during approach.
