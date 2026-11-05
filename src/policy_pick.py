@@ -1584,9 +1584,9 @@ def lock_curriculum_at_iter(iter_num: int | None, num_steps_per_env: int = 24) -
 
 
 def pick_curriculum(env, env_ids):
-    """Single-axis curriculum ramping body_bias from 1.0 (robot spawns in SQUAT_GRIP_POSE, hands already at the box on the table) to 0.0 (robot spawns from a walk-terminal sample). No box curriculum: the box always spawns on the table so the task the policy solves stays identical across training, which keeps the reward curve monotonic (no reward-ceiling shifts) unlike the previous two-axis hand_bias / arm_bias / scale ramp.
+    """Reconstituted R2 curriculum: three sequential ramps on reset distribution, lift-speed penalty, and action-rate penalty. body_bias handles the task difficulty (hands-at-box to walk-sample reset), then box_lift_vel comes online to shape the ascent dynamics, then action_rate tightens for the polish phase. Separating the three stages avoids the collapse seen in R4, where box_lift_vel went live with full weight from iter 0 and fought the body_bias transition.
     Args: env: the RL env; env_ids: envs being updated (unused, curriculum is global).
-    Returns: dict with pick_body_bias for logging.
+    Returns: dict with pick_body_bias, pick_box_lift_vel_w, pick_action_rate_w for logging.
     """
     # Per-env counter (fresh at every runner) instead of env.common_step_counter, which persists across runner.load() and made the curriculum skip past the ramp on resume.
     if _PICK_CURRICULUM_LOCKED_STEP is not None:
@@ -1596,19 +1596,49 @@ def pick_curriculum(env, env_ids):
             env._pick_curriculum_step = 0
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
-    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 -> 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses. No weight ramps on box_lift_vel or action_rate_l2: those stay at their constant reward-dict values so the only time-varying MDP shift is the reset distribution.
+
+    # Stage 1 (step 0 to 72k): body_bias 1.0 -> 0.0 (hold 24k, smoothstep 48k). Teaches pick/lift from an ideal pose before handing the robot realistic walk-buffer resets.
     if step < 24_000:
         body_bias = 1.0
-    elif step < 96_000:
-        body_bias = 1.0 - _smoothstep((step - 24_000) / (96_000 - 24_000))
+    elif step < 72_000:
+        body_bias = 1.0 - _smoothstep((step - 24_000) / (72_000 - 24_000))
     else:
         body_bias = 0.0
+
+    # Stage 2 (step 72k to 120k): box_lift_vel_w 0.0 -> -6.0 (hold at 0 through body_bias ramp, smoothstep over 24k). Shapes controlled ascent only after the policy has learned the base grasp-and-lift motion; introducing it earlier (as in R4) created the "cai rapido" attractor.
+    if step < 96_000:
+        box_lift_vel_w = 0.0
+    elif step < 120_000:
+        box_lift_vel_w = -6.0 * _smoothstep((step - 96_000) / (120_000 - 96_000))
+    else:
+        box_lift_vel_w = -6.0
+
+    # Stage 3 (step 120k to 144k): action_rate -0.01 -> -0.02 (hold until box_lift_vel is at full strength, then smoothstep over 24k). Polishes the final motion after the two preceding stages have landed.
+    if step < 120_000:
+        action_rate_w = -1.0e-2
+    elif step < 144_000:
+        action_rate_w = -1.0e-2 + (-2.0e-2 - -1.0e-2) * _smoothstep((step - 120_000) / (144_000 - 120_000))
+    else:
+        action_rate_w = -2.0e-2
+
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_base")
         term_cfg.params["body_bias"] = body_bias
     except Exception:
         pass
-    return {"pick_body_bias": body_bias}
+    try:
+        rt_cfg = env.reward_manager.get_term_cfg("box_lift_vel")
+        rt_cfg.weight = box_lift_vel_w
+    except Exception:
+        pass
+    try:
+        rt_cfg = env.reward_manager.get_term_cfg("action_rate_l2")
+        rt_cfg.weight = action_rate_w
+    except Exception:
+        pass
+    return {"pick_body_bias": body_bias,
+            "pick_box_lift_vel_w": box_lift_vel_w,
+            "pick_action_rate_w": action_rate_w}
 
 
 # MDP assembly.
@@ -1847,9 +1877,9 @@ def build_g1_pick_mdp():
                     "box_cfg": box, "gate_dist": 0.25,
                     "w_lin": 1.0, "w_ang": 0.1},
         ),
-        # Mirror of drop's box_impact_velocity_penalty, re-enabled after the 2026-10-29_01-41-39 run shipped without it. Penalises box |v|^2 during ascent (0 -> gate_z m), double-gated by both hands at the pinch anchors so numerical jitter at rest never fires it. Weight -4.0 vs drop's -6.0 on impact: lifting is lower-stakes than landing (no table collision cliff), so a lighter pull still shapes a controlled climb without starving lift_progress.
+        # Mirror of drop's box_impact_velocity_penalty. Initial weight 0.0 because pick_curriculum ramps this to -6.0 between step 96k and 120k (after body_bias has handed over to walk-buffer resets). Running it at constant weight from iter 0 (as the 2026-10-29_16-47-17 run did) produced a "fall-fast" attractor that zeroed the term and collapsed the policy. Penalises box |v|^2 during ascent (0 to gate_z m), double-gated by both hands at the pinch anchors so numerical jitter at rest never fires it.
         "box_lift_vel": RewardTermCfg(
-            func=box_lift_velocity_penalty, weight=-4.0,
+            func=box_lift_velocity_penalty, weight=0.0,
             params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "gate_z": 0.35, "hold_dist": 0.15,
                     "w_lin": 1.0, "w_ang": 0.1},
@@ -2069,9 +2099,9 @@ def g1_pick_ppo_runner_cfg():
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
-            entropy_coef=5e-4,
+            entropy_coef=1e-3,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
-            gamma=0.99, lam=0.95, desired_kl=0.005, max_grad_norm=1.0,
+            gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
             symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,
         ),
         clip_actions=3.0,
