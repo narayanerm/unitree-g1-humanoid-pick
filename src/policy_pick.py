@@ -1484,7 +1484,14 @@ def reset_from_walk_buffer(
     # Full-body lerp; renormalise quaternion since lerp of unit quats drifts off the sphere.
     joint_pos = bb * squat_joint + (1.0 - bb) * walk_joint
     root_z    = bb * squat_z + (1.0 - bb) * walk_z
-    root_quat_base = bb * squat_quat + (1.0 - bb) * walk_quat
+    # Hemisphere-align walk_quat against squat_quat before the lerp: q and -q represent the
+    # same rotation, but ~50% of walk buffer samples have w < 0, so a naive lerp against the
+    # squat identity (w=+1) passes through the origin at bb ~ 0.5 and normalises to a random
+    # orientation (observed: robot spawns upside-down in half the resets, which collapses
+    # training midway through stage 1 of the curriculum).
+    dot = (squat_quat * walk_quat).sum(dim=-1, keepdim=True)
+    walk_quat_aligned = torch.where(dot < 0, -walk_quat, walk_quat)
+    root_quat_base = bb * squat_quat + (1.0 - bb) * walk_quat_aligned
     root_quat_base = root_quat_base / torch.linalg.norm(
         root_quat_base, dim=-1, keepdim=True,
     ).clamp(min=1e-6)
@@ -1597,27 +1604,27 @@ def pick_curriculum(env, env_ids):
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
 
-    # Stage 1 (step 0 to 72k): body_bias 1.0 -> 0.0 (hold 24k, smoothstep 48k). Teaches pick/lift from an ideal pose before handing the robot realistic walk-buffer resets.
-    if step < 24_000:
+    # Stage 1 (step 0 to 48k, iter 0 to 2000): body_bias 1.0 -> 0.0 (hold 16k, smoothstep 32k). Teaches pick/lift from an ideal pose before handing the robot realistic walk-buffer resets.
+    if step < 16_000:
         body_bias = 1.0
-    elif step < 72_000:
-        body_bias = 1.0 - _smoothstep((step - 24_000) / (72_000 - 24_000))
+    elif step < 48_000:
+        body_bias = 1.0 - _smoothstep((step - 16_000) / (48_000 - 16_000))
     else:
         body_bias = 0.0
 
-    # Stage 2 (step 72k to 120k): box_lift_vel_w 0.0 -> -6.0 (hold at 0 through body_bias ramp, smoothstep over 24k). Shapes controlled ascent only after the policy has learned the base grasp-and-lift motion; introducing it earlier (as in R4) created the "cai rapido" attractor.
-    if step < 96_000:
+    # Stage 2 (step 64k to 80k, iter 2667 to 3333): box_lift_vel_w 0.0 -> -6.0 (hold at 0 through body_bias ramp + gap, smoothstep over 16k). Shapes controlled ascent only after the policy has learned the base grasp-and-lift motion; introducing it earlier (as in R4) created the "cai rapido" attractor.
+    if step < 64_000:
         box_lift_vel_w = 0.0
-    elif step < 120_000:
-        box_lift_vel_w = -6.0 * _smoothstep((step - 96_000) / (120_000 - 96_000))
+    elif step < 80_000:
+        box_lift_vel_w = -6.0 * _smoothstep((step - 64_000) / (80_000 - 64_000))
     else:
         box_lift_vel_w = -6.0
 
-    # Stage 3 (step 120k to 144k): action_rate -0.01 -> -0.02 (hold until box_lift_vel is at full strength, then smoothstep over 24k). Polishes the final motion after the two preceding stages have landed.
-    if step < 120_000:
+    # Stage 3 (step 80k to 96k, iter 3333 to 4000): action_rate -0.01 -> -0.02 (hold until box_lift_vel is at full strength, then smoothstep over 16k). Polishes the final motion after the two preceding stages have landed.
+    if step < 80_000:
         action_rate_w = -1.0e-2
-    elif step < 144_000:
-        action_rate_w = -1.0e-2 + (-2.0e-2 - -1.0e-2) * _smoothstep((step - 120_000) / (144_000 - 120_000))
+    elif step < 96_000:
+        action_rate_w = -1.0e-2 + (-2.0e-2 - -1.0e-2) * _smoothstep((step - 80_000) / (96_000 - 80_000))
     else:
         action_rate_w = -2.0e-2
 
