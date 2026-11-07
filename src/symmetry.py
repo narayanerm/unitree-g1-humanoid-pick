@@ -92,8 +92,8 @@ def _mirror_wrist_torque(x: torch.Tensor) -> torch.Tensor:
     return torch.index_select(x, dim=-1, index=perm) * signs
 
 
-# Pick obs layout (147 dims).
-PICK_OBS_DIM = 147
+# Pick obs layout (159 dims: 147 original + 12 bimanual command/actual).
+PICK_OBS_DIM = 159
 
 PICK_OBS_LAYOUT = {
     "base_lin_vel":          (0,   3),
@@ -117,14 +117,20 @@ PICK_OBS_LAYOUT = {
     "cmd_object_target_quat": (136, 140),
     "cmd_lift_target_pos":    (140, 143),
     "cmd_lift_target_quat":   (143, 147),
+    "v_abs_body":            (147, 150),
+    "v_rel_body":            (150, 153),
+    "grasp_v_abs_cmd":       (153, 156),
+    "grasp_v_rel_cmd":       (156, 159),
 }
-assert PICK_OBS_LAYOUT["cmd_lift_target_quat"][1] == PICK_OBS_DIM
+assert PICK_OBS_LAYOUT["grasp_v_rel_cmd"][1] == PICK_OBS_DIM
 
 # Per-term element-wise sign vector for simple flip terms.
 _VEC_Y_FLIP        = (1.0, -1.0, 1.0)
 _PSEUDOVEC_Y_FLIP  = (-1.0, 1.0, -1.0)
 _QUAT_BODY_MIRROR  = (1.0, -1.0, 1.0, -1.0)
 _TWIST_MIRROR      = (1.0, -1.0, -1.0)  # (vx, vy, wz)
+
+_VREL_MIRROR = (-1.0, 1.0, -1.0)
 
 PICK_OBS_SIGNS = {
     "base_lin_vel":          _VEC_Y_FLIP,
@@ -140,6 +146,11 @@ PICK_OBS_SIGNS = {
     "cmd_object_target_quat": _QUAT_BODY_MIRROR,
     "cmd_lift_target_pos":    _VEC_Y_FLIP,
     "cmd_lift_target_quat":   _QUAT_BODY_MIRROR,
+    # Under sagittal mirror v_abs is a body-frame vector (y flip); v_rel becomes -(y-flip)(v_rel) because the hand identities also swap.
+    "v_abs_body":            _VEC_Y_FLIP,
+    "v_rel_body":            _VREL_MIRROR,
+    "grasp_v_abs_cmd":       _VEC_Y_FLIP,
+    "grasp_v_rel_cmd":       _VREL_MIRROR,
 }
 
 

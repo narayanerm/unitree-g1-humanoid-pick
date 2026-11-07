@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mujoco
 import torch
@@ -29,6 +29,7 @@ from mjlab.envs.mdp import dr, joint_pos_rel, joint_vel_rel, last_action, time_o
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, RewardTermCfg
 from mjlab.managers.action_manager import ActionTermCfg
+from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -134,16 +135,20 @@ SQUAT_GRIP_POSE = {
     "waist_yaw_joint":         0.0,
     "waist_roll_joint":        0.0,
     "waist_pitch_joint":       0.90,
-    # Arms: strong shoulder_pitch forward-down, shoulder_roll opened outward to y~+/-0.13, elbow moderately bent (~63 deg) so the pose is visibly bent. Empirical FK sweep places the wrists at (0.502, +/-0.107, 0.627): 3 cm from the target box side-face anchor at (0.51, +/-0.13, 0.605).
+    # Arms: strong shoulder_pitch forward-down, shoulder_roll opened outward so wrists land
+    # outside the box lateral faces (y=+/-0.105). shoulder_roll was 0.25 which put the wrist
+    # at y=+/-0.107 (only 2 mm clearance): the palm geom extending inward from the wrist
+    # ended up inside the box on reset. 0.40 pushes wrists to y~+/-0.16 (~5 cm clearance)
+    # so the whole hand clears the box face even under full DR.
     "left_shoulder_pitch_joint":  -1.60,
-    "left_shoulder_roll_joint":    0.25,
+    "left_shoulder_roll_joint":    0.40,
     "left_shoulder_yaw_joint":     0.0,
     "left_elbow_joint":            1.10,
     "left_wrist_roll_joint":       0.0,
     "left_wrist_pitch_joint":      0.0,
     "left_wrist_yaw_joint":        0.0,
     "right_shoulder_pitch_joint": -1.60,
-    "right_shoulder_roll_joint":  -0.25,
+    "right_shoulder_roll_joint":  -0.40,
     "right_shoulder_yaw_joint":    0.0,
     "right_elbow_joint":           1.10,
     "right_wrist_roll_joint":      0.0,
@@ -333,6 +338,95 @@ def _base_yaw_quat_w(env) -> torch.Tensor:
     return yaw_quat(env.scene["robot"].data.root_link_quat_w)
 
 
+def _hand_body_idx(env, left_hand_cfg, right_hand_cfg):
+    """Cache (left, right) wrist body indices on the env."""
+    if not hasattr(env, "_hand_body_idx_cache"):
+        body_names = list(env.scene["robot"].body_names)
+        lh = left_hand_cfg.body_names[0] if isinstance(left_hand_cfg.body_names, (list, tuple)) else left_hand_cfg.body_names
+        rh = right_hand_cfg.body_names[0] if isinstance(right_hand_cfg.body_names, (list, tuple)) else right_hand_cfg.body_names
+        env._hand_body_idx_cache = (body_names.index(lh), body_names.index(rh))
+    return env._hand_body_idx_cache
+
+
+def _hand_vels_body(env, left_hand_cfg, right_hand_cfg):
+    """Return (v_L, v_R) of the two wrists in body-yaw frame, each (N, 3)."""
+    il, ir = _hand_body_idx(env, left_hand_cfg, right_hand_cfg)
+    robot = env.scene["robot"]
+    q = _base_yaw_quat_w(env)
+    lv = quat_apply_inverse(q, robot.data.body_link_lin_vel_w[:, il])
+    rv = quat_apply_inverse(q, robot.data.body_link_lin_vel_w[:, ir])
+    return lv, rv
+
+
+# Cooperative bimanual command (Uchiyama 1988 / Caccavale-Siciliano 1999): v_abs is the velocity of the grasp midpoint and v_rel is the left-minus-right difference, both in body-yaw frame.
+@dataclass(kw_only=True)
+class BimanualAbsRelCommandCfg(CommandTermCfg):
+    entity_name: str = "robot"
+    left_hand_name: str = "left_wrist_yaw_link"
+    right_hand_name: str = "right_wrist_yaw_link"
+    rel_zero_envs: float = 0.6
+    """Fraction of envs that sample v_rel_cmd = 0 (preserve-grasp bias)."""
+
+    @dataclass
+    class Ranges:
+        v_abs_x: tuple[float, float] = (-0.2, 0.2)
+        v_abs_y: tuple[float, float] = (-0.15, 0.15)
+        v_abs_z: tuple[float, float] = (-0.1, 0.4)
+        v_rel_x: tuple[float, float] = (-0.3, 0.3)
+        v_rel_y: tuple[float, float] = (-0.3, 0.3)
+        v_rel_z: tuple[float, float] = (-0.3, 0.3)
+
+    ranges: Ranges = field(default_factory=Ranges)
+
+    def build(self, env):
+        return BimanualAbsRelCommand(self, env)
+
+
+class BimanualAbsRelCommand(CommandTerm):
+    cfg: BimanualAbsRelCommandCfg
+
+    def __init__(self, cfg: BimanualAbsRelCommandCfg, env):
+        super().__init__(cfg, env)
+        self.cmd = torch.zeros(self.num_envs, 6, device=self.device)
+        self.metrics["error_v_abs"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_v_rel"] = torch.zeros(self.num_envs, device=self.device)
+        body_names = list(env.scene[cfg.entity_name].body_names)
+        self._idx = (body_names.index(cfg.left_hand_name), body_names.index(cfg.right_hand_name))
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.cmd
+
+    def _current(self):
+        robot = self._env.scene[self.cfg.entity_name]
+        q = yaw_quat(robot.data.root_link_quat_w)
+        lv = quat_apply_inverse(q, robot.data.body_link_lin_vel_w[:, self._idx[0]])
+        rv = quat_apply_inverse(q, robot.data.body_link_lin_vel_w[:, self._idx[1]])
+        return 0.5 * (lv + rv), (lv - rv)
+
+    def _update_metrics(self) -> None:
+        max_steps = max(1.0, self.cfg.resampling_time_range[1] / self._env.step_dt)
+        v_abs, v_rel = self._current()
+        self.metrics["error_v_abs"] += torch.norm(self.cmd[:, :3] - v_abs, dim=-1) / max_steps
+        self.metrics["error_v_rel"] += torch.norm(self.cmd[:, 3:] - v_rel, dim=-1) / max_steps
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        r = torch.empty(len(env_ids), device=self.device)
+        rg = self.cfg.ranges
+        self.cmd[env_ids, 0] = r.uniform_(*rg.v_abs_x)
+        self.cmd[env_ids, 1] = r.uniform_(*rg.v_abs_y)
+        self.cmd[env_ids, 2] = r.uniform_(*rg.v_abs_z)
+        self.cmd[env_ids, 3] = r.uniform_(*rg.v_rel_x)
+        self.cmd[env_ids, 4] = r.uniform_(*rg.v_rel_y)
+        self.cmd[env_ids, 5] = r.uniform_(*rg.v_rel_z)
+        zero_mask = torch.rand(len(env_ids), device=self.device) < self.cfg.rel_zero_envs
+        if zero_mask.any():
+            self.cmd[env_ids[zero_mask], 3:] = 0.0
+
+    def _update_command(self) -> None:
+        pass
+
+
 # Box signals sanitized so MuJoCo divergences never trip rsl_rl.check_nan.
 def box_position_obs(env, box_cfg):
     """Robot-to-box offset in body-yaw frame, sanitized and clamped.
@@ -353,6 +447,28 @@ def box_lin_vel_obs(env, box_cfg):
     v = env.scene[box_cfg.name].data.root_link_lin_vel_w
     v = quat_apply_inverse(_base_yaw_quat_w(env), v)
     return torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0).clamp(-5.0, 5.0)
+
+
+def v_abs_body_obs(env, left_hand_cfg, right_hand_cfg):
+    """Observed v_abs of the two wrists in body-yaw frame, (num_envs, 3)."""
+    lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
+    return (0.5 * (lv + rv)).clamp(-5.0, 5.0)
+
+
+def v_rel_body_obs(env, left_hand_cfg, right_hand_cfg):
+    """Observed v_rel = v_L - v_R in body-yaw frame, (num_envs, 3)."""
+    lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
+    return (lv - rv).clamp(-5.0, 5.0)
+
+
+def grasp_v_abs_cmd_obs(env, command_name: str = "grasp"):
+    """First three components of the bimanual command (v_abs_cmd)."""
+    return env.command_manager.get_command(command_name)[:, :3]
+
+
+def grasp_v_rel_cmd_obs(env, command_name: str = "grasp"):
+    """Last three components of the bimanual command (v_rel_cmd)."""
+    return env.command_manager.get_command(command_name)[:, 3:]
 
 
 def box_ang_vel_obs(env, box_cfg):
@@ -438,10 +554,20 @@ def reset_pick_command_and_object(
     origins = env.scene.env_origins[env_ids]
     zero = torch.zeros(n, device=device)
 
-    # Box always resting on the table with fixed +/-5 cm xy / +/-20 deg yaw jitter; no curriculum on the box itself so the task the policy solves stays identical across training.
-    ox = sample_uniform(-OBJECT_XY_JITTER_X, OBJECT_XY_JITTER_X, (n,), device=device)
-    oy = sample_uniform(-OBJECT_XY_JITTER_Y, OBJECT_XY_JITTER_Y, (n,), device=device)
-    o_yaw = sample_uniform(-OBJECT_YAW_RANGE, OBJECT_YAW_RANGE, (n,), device=device)
+    # Box always resting on the table; xy/yaw jitter scales with (1 - body_bias) so the
+    # SQUAT_GRIP endpoint (bb=1) spawns the box deterministically at BOX_START_X and the
+    # walk endpoint (bb=0) keeps the full DR range. Reads bb from the reset_base event
+    # params, which pick_curriculum updates each step. Default bb=0 keeps walk behaviour
+    # on bare startup.
+    try:
+        bb = float(env.event_manager.get_term_cfg("reset_base").params.get("body_bias", 0.0))
+    except Exception:
+        bb = 0.0
+    bb = max(0.0, min(1.0, bb))
+    jitter_scale_scalar = 1.0 - bb
+    ox = sample_uniform(-OBJECT_XY_JITTER_X * jitter_scale_scalar, OBJECT_XY_JITTER_X * jitter_scale_scalar, (n,), device=device)
+    oy = sample_uniform(-OBJECT_XY_JITTER_Y * jitter_scale_scalar, OBJECT_XY_JITTER_Y * jitter_scale_scalar, (n,), device=device)
+    o_yaw = sample_uniform(-OBJECT_YAW_RANGE * jitter_scale_scalar, OBJECT_YAW_RANGE * jitter_scale_scalar, (n,), device=device)
     obj_pos_w = torch.stack([
         origins[:, 0] + BOX_START_X + ox,
         origins[:, 1] + oy,
@@ -795,6 +921,24 @@ def box_lift_velocity_penalty(env, box_cfg, left_hand_cfg, right_hand_cfg,
     lin_sq = (box_v ** 2).sum(dim=-1)
     ang_sq = (box_w ** 2).sum(dim=-1)
     return ascent_gate * hold_gate * (w_lin * lin_sq + w_ang * ang_sq)
+
+
+def track_v_abs_reward(env, left_hand_cfg, right_hand_cfg, command_name: str = "grasp", sigma: float = 0.25):
+    """Gaussian tracking of the commanded grasp-midpoint velocity (v_abs) in body-yaw frame."""
+    lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
+    v_abs = 0.5 * (lv + rv)
+    cmd = env.command_manager.get_command(command_name)[:, :3]
+    err_sq = ((v_abs - cmd) ** 2).sum(dim=-1)
+    return torch.exp(-err_sq / (sigma ** 2))
+
+
+def track_v_rel_reward(env, left_hand_cfg, right_hand_cfg, command_name: str = "grasp", sigma: float = 0.25):
+    """Gaussian tracking of the commanded hand-difference velocity (v_rel = v_L - v_R) in body-yaw frame."""
+    lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
+    v_rel = lv - rv
+    cmd = env.command_manager.get_command(command_name)[:, 3:]
+    err_sq = ((v_rel - cmd) ** 2).sum(dim=-1)
+    return torch.exp(-err_sq / (sigma ** 2))
 
 
 def foot_slip_penalty(env, left_foot_cfg, right_foot_cfg,
@@ -1481,30 +1625,38 @@ def reset_from_walk_buffer(
         SQUAT_GRIP_ROOT_ROT, device=device, dtype=torch.float32,
     ).unsqueeze(0).expand(n, -1).clone()
 
-    # Full-body lerp; renormalise quaternion since lerp of unit quats drifts off the sphere.
-    joint_pos = bb * squat_joint + (1.0 - bb) * walk_joint
-    root_z    = bb * squat_z + (1.0 - bb) * walk_z
-    # Hemisphere-align walk_quat against squat_quat before the lerp: q and -q represent the
-    # same rotation, but ~50% of walk buffer samples have w < 0, so a naive lerp against the
-    # squat identity (w=+1) passes through the origin at bb ~ 0.5 and normalises to a random
-    # orientation (observed: robot spawns upside-down in half the resets, which collapses
-    # training midway through stage 1 of the curriculum).
+    # Continuous lerp between SQUAT_GRIP (bb=1) and the walk-buffer sample (bb=0). The
+    # quaternion lerp first hemisphere-aligns the walk sample against the squat identity
+    # (half of the buffer has w<0, which otherwise collapses the lerp through the origin
+    # at bb~0.5 and spawns upside-down resets). Box jitter is coordinated downstream via
+    # the body_bias stored in the event params (reset_pick_command_and_object scales its
+    # own xy/yaw jitter by 1 - bb so the squat endpoint stays deterministic).
+    if walk_z.dim() == 1:
+        walk_z = walk_z.unsqueeze(-1)
+    squat_z = torch.full_like(walk_z, SQUAT_GRIP_ROOT_POS[2])
+
     dot = (squat_quat * walk_quat).sum(dim=-1, keepdim=True)
     walk_quat_aligned = torch.where(dot < 0, -walk_quat, walk_quat)
+
+    joint_pos      = bb * squat_joint + (1.0 - bb) * walk_joint
+    root_z         = bb * squat_z + (1.0 - bb) * walk_z
     root_quat_base = bb * squat_quat + (1.0 - bb) * walk_quat_aligned
     root_quat_base = root_quat_base / torch.linalg.norm(
         root_quat_base, dim=-1, keepdim=True,
     ).clamp(min=1e-6)
 
-    # Scale jitter by (1 - body_bias) so squat mode spawns the robot deterministically in front of the box (facing +x, at SQUAT_GRIP_ROOT_POS xy) and walk mode keeps the full DR range.
-    jitter_scale = 1.0 - bb
-    xy_jitter = sample_uniform(xy_range[0] * jitter_scale, xy_range[1] * jitter_scale, (n, 2), device=device)
-    yaw_jitter = sample_uniform(yaw_range[0] * jitter_scale, yaw_range[1] * jitter_scale, (n,), device=device)
+    # Scalar jitter scale: 0 at bb=1 (squat endpoint deterministic), 1 at bb=0 (full DR).
+    jitter_scale_scalar = max(0.0, 1.0 - bb)
+    xy_jitter = sample_uniform(xy_range[0] * jitter_scale_scalar, xy_range[1] * jitter_scale_scalar, (n, 2), device=device)
+    yaw_jitter = sample_uniform(yaw_range[0] * jitter_scale_scalar, yaw_range[1] * jitter_scale_scalar, (n,), device=device)
     zero = torch.zeros_like(yaw_jitter)
     q_yaw = quat_from_euler_xyz(zero, zero, yaw_jitter)
     root_quat = quat_mul(q_yaw, root_quat_base)
 
-    # Velocity lerp: at bb=1 the robot inherits SQUAT_GRIP posture without inertia (zeros); at bb=0 it carries walk-terminal residual momentum (base ang_vel ~1 rad/s, joint_vel norm ~7). The prior zero-velocity reset trained the pick on a manifold the FSM handover never reaches, so the walk->pick transition shocked the policy out of its support (measured on a 2000-ep monolithic dataset: 87% of fallen episodes dropped within 1.6 s of handover, with median base ang_vel 1.33 rad/s vs training's zero-plus-DR-push cap of 0.78 rad/s). Re-rotate base velocities from the walk sample's yaw-aligned frame into the reset's world yaw (quat_zy has yaw=0, so q_yaw is the only yaw component left in root_quat); joint_vel is already body-local and frame-agnostic.
+    # Velocity lerp: carry walk-terminal residual momentum scaled by (1 - bb), re-rotated
+    # from the sample's yaw-aligned frame (quat_zy has yaw=0) into the reset's world yaw;
+    # joint_vel is body-local and frame-agnostic. Keeps the walk->pick transition on the
+    # manifold the policy trains on (the zero-velocity reset shocked the FSM handover).
     if walk_lin_vel_by is not None and walk_ang_vel_by is not None:
         walk_lin_vel_w = quat_apply(q_yaw, walk_lin_vel_by)
         walk_ang_vel_w = quat_apply(q_yaw, walk_ang_vel_by)
@@ -1543,8 +1695,10 @@ def reset_from_walk_buffer(
     else:
         walk_mode_xy_local = default_root_state[:, 0:2] + walk_xy_offset
 
-    # Blend root_xy between the walk-mode spawn (buffer-derived or WALK_MODE_XY_OFFSET fallback) and the SQUAT_GRIP offset (absolute world offset from env origin, not additive to walk default). At bb=0 pelvis lands at walk-mode xy; at bb=1 at exactly SQUAT_GRIP_ROOT_POS[:2].
-    root_xy = (1.0 - bb) * walk_mode_xy_local + bb * squat_xy_offset + xy_jitter + origins[:, 0:2]
+    # Continuous root_xy lerp between the walk-mode spawn (buffer-derived or WALK_MODE_XY_OFFSET
+    # fallback) and the SQUAT_GRIP absolute offset from the env origin.
+    root_xy = ((1.0 - bb) * walk_mode_xy_local + bb * squat_xy_offset
+               + xy_jitter + origins[:, 0:2])
     root_z_col = root_z if root_z.dim() == 2 else root_z.unsqueeze(-1)
     root_z_w = root_z_col + origins[:, 2:3]
     positions = torch.cat([root_xy, root_z_w], dim=-1)
@@ -1591,7 +1745,11 @@ def lock_curriculum_at_iter(iter_num: int | None, num_steps_per_env: int = 24) -
 
 
 def pick_curriculum(env, env_ids):
-    """Reconstituted R2 curriculum: three sequential ramps on reset distribution, lift-speed penalty, and action-rate penalty. body_bias handles the task difficulty (hands-at-box to walk-sample reset), then box_lift_vel comes online to shape the ascent dynamics, then action_rate tightens for the polish phase. Separating the three stages avoids the collapse seen in R4, where box_lift_vel went live with full weight from iter 0 and fought the body_bias transition.
+    """Single continuous curriculum: short hold at the SQUAT_GRIP endpoint for the policy to
+    consolidate the base lift motion, then all three axes (body_bias, box_lift_vel, action_rate)
+    smoothstep together to their training targets. Prior version sequenced the three ramps,
+    but with the quat hemisphere bug resolved there is no longer a reason to defer box_lift_vel,
+    and a unified ramp halves the total curriculum budget (matches drop's single-ramp schedule).
     Args: env: the RL env; env_ids: envs being updated (unused, curriculum is global).
     Returns: dict with pick_body_bias, pick_box_lift_vel_w, pick_action_rate_w for logging.
     """
@@ -1604,38 +1762,24 @@ def pick_curriculum(env, env_ids):
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
 
-    # Stage 1 (step 0 to 48k, iter 0 to 2000): body_bias 1.0 -> 0.0 (hold 16k, smoothstep 32k). Teaches pick/lift from an ideal pose before handing the robot realistic walk-buffer resets.
-    if step < 16_000:
-        body_bias = 1.0
-    elif step < 48_000:
-        body_bias = 1.0 - _smoothstep((step - 16_000) / (48_000 - 16_000))
+    # Hold phase (step 0 to 16k, iter 0 to 667): all three axes at the easy endpoint so the
+    # policy learns the base lift-from-SQUAT_GRIP motion before any ramping starts.
+    # Ramp phase (step 16k to 96k, iter 667 to 4000): all axes smoothstep together.
+    HOLD_END = 16_000
+    RAMP_END = 96_000
+    if step < HOLD_END:
+        frac = 0.0
+    elif step < RAMP_END:
+        frac = _smoothstep((step - HOLD_END) / (RAMP_END - HOLD_END))
     else:
-        body_bias = 0.0
+        frac = 1.0
 
-    # Stage 2 (step 64k to 80k, iter 2667 to 3333): box_lift_vel_w 0.0 -> -6.0 (hold at 0 through body_bias ramp + gap, smoothstep over 16k). Shapes controlled ascent only after the policy has learned the base grasp-and-lift motion; introducing it earlier (as in R4) created the "cai rapido" attractor.
-    if step < 64_000:
-        box_lift_vel_w = 0.0
-    elif step < 80_000:
-        box_lift_vel_w = -6.0 * _smoothstep((step - 64_000) / (80_000 - 64_000))
-    else:
-        box_lift_vel_w = -6.0
-
-    # Stage 3 (step 80k to 96k, iter 3333 to 4000): action_rate -0.01 -> -0.02 (hold until box_lift_vel is at full strength, then smoothstep over 16k). Polishes the final motion after the two preceding stages have landed.
-    if step < 80_000:
-        action_rate_w = -1.0e-2
-    elif step < 96_000:
-        action_rate_w = -1.0e-2 + (-2.0e-2 - -1.0e-2) * _smoothstep((step - 80_000) / (96_000 - 80_000))
-    else:
-        action_rate_w = -2.0e-2
+    body_bias       = 1.0 - frac
+    action_rate_w   = -1.0e-2 + (-2.0e-2 - -1.0e-2) * frac
 
     try:
         term_cfg = env.event_manager.get_term_cfg("reset_base")
         term_cfg.params["body_bias"] = body_bias
-    except Exception:
-        pass
-    try:
-        rt_cfg = env.reward_manager.get_term_cfg("box_lift_vel")
-        rt_cfg.weight = box_lift_vel_w
     except Exception:
         pass
     try:
@@ -1644,7 +1788,6 @@ def pick_curriculum(env, env_ids):
     except Exception:
         pass
     return {"pick_body_bias": body_bias,
-            "pick_box_lift_vel_w": box_lift_vel_w,
             "pick_action_rate_w": action_rate_w}
 
 
@@ -1791,6 +1934,11 @@ def build_g1_pick_mdp():
         "cmd_object_target_quat": ObservationTermCfg(func=cmd_object_target_quat_obs),
         "cmd_lift_target_pos":    ObservationTermCfg(func=cmd_lift_target_pos_obs),
         "cmd_lift_target_quat":   ObservationTermCfg(func=cmd_lift_target_quat_obs),
+        # Bimanual command (v_abs + v_rel in body-yaw frame) and the current observed values.
+        "v_abs_body":        ObservationTermCfg(func=v_abs_body_obs,        params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand}, noise=Unoise(n_min=-0.05, n_max=0.05)),
+        "v_rel_body":        ObservationTermCfg(func=v_rel_body_obs,        params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand}, noise=Unoise(n_min=-0.05, n_max=0.05)),
+        "grasp_v_abs_cmd":   ObservationTermCfg(func=grasp_v_abs_cmd_obs,   params={"command_name": "grasp"}),
+        "grasp_v_rel_cmd":   ObservationTermCfg(func=grasp_v_rel_cmd_obs,   params={"command_name": "grasp"}),
     }
     observations = {
         "actor":  ObservationGroupCfg(actor_terms, enable_corruption=True),
@@ -1877,19 +2025,16 @@ def build_g1_pick_mdp():
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
-        # Bumped -1.0 -> -3.0 to match drop's hand_approach_vel weight. The 2026-10-29_01-41-39 run converged with mean_std=0.96 and visibly snappy hand descents; drop's -3.0 setting produces controlled approach without freezing the arm. Paired with box_lift_vel so the policy has two concurrent pressures on upper-body speed during the grasp->lift segment.
-        "hand_approach_vel": RewardTermCfg(
-            func=hand_approach_velocity_penalty, weight=-3.0,
+        # Cooperative bimanual velocity tracking (Uchiyama-Caccavale decomposition). Replaces hand_approach_vel and box_lift_vel: a commanded v_abs upper-bounds the grasp-midpoint speed at every phase, and a commanded v_rel = 0 preserves the internal grasp (sampled non-zero on a fraction of envs so the policy still learns to converge pre-grasp from asymmetric resets). sigma=0.25 m/s matches the half-range of the command box.
+        "track_v_abs": RewardTermCfg(
+            func=track_v_abs_reward, weight=2.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "box_cfg": box, "gate_dist": 0.25,
-                    "w_lin": 1.0, "w_ang": 0.1},
+                    "command_name": "grasp", "sigma": 0.25},
         ),
-        # Mirror of drop's box_impact_velocity_penalty. Initial weight 0.0 because pick_curriculum ramps this to -6.0 between step 96k and 120k (after body_bias has handed over to walk-buffer resets). Running it at constant weight from iter 0 (as the 2026-10-29_16-47-17 run did) produced a "fall-fast" attractor that zeroed the term and collapsed the policy. Penalises box |v|^2 during ascent (0 to gate_z m), double-gated by both hands at the pinch anchors so numerical jitter at rest never fires it.
-        "box_lift_vel": RewardTermCfg(
-            func=box_lift_velocity_penalty, weight=0.0,
-            params={"box_cfg": box, "left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "gate_z": 0.35, "hold_dist": 0.15,
-                    "w_lin": 1.0, "w_ang": 0.1},
+        "track_v_rel": RewardTermCfg(
+            func=track_v_rel_reward, weight=1.0,
+            params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "command_name": "grasp", "sigma": 0.25},
         ),
         # Soft, dense pressure against foot shuffling during grasp: replaces the cfea102 foot_displaced termination (cliff at 6 cm that produced high-variance returns). Weight -1.0 is intentionally modest; both feet at 0.5 m/s slip cost ~ -0.5/step so it competes with hand_approach_vel without freezing legs during approach.
         "foot_slip": RewardTermCfg(
@@ -2033,6 +2178,17 @@ def build_g1_pick_mdp():
         "reset_stages": CurriculumTermCfg(func=pick_curriculum, params={}),
     }
 
+    # Bimanual v_abs + v_rel command, body-yaw frame, resampled every 3-8 s to match the walk twist cadence.
+    commands = {
+        "grasp": BimanualAbsRelCommandCfg(
+            resampling_time_range=(3.0, 8.0),
+            entity_name="robot",
+            left_hand_name="left_wrist_yaw_link",
+            right_hand_name="right_wrist_yaw_link",
+            rel_zero_envs=0.6,
+        ),
+    }
+
     return {
         "robot_cfg": robot_cfg,
         "table_cfg": table_cfg,
@@ -2044,6 +2200,7 @@ def build_g1_pick_mdp():
         "events":       events,
         "terminations": terminations,
         "curriculum":   curriculum,
+        "commands":     commands,
     }
 
 
@@ -2067,6 +2224,7 @@ def g1_pick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         rewards=parts["rewards"],
         terminations=parts["terminations"],
         curriculum=parts["curriculum"],
+        commands=parts["commands"],
         viewer=ViewerConfig(
             origin_type=ViewerConfig.OriginType.ASSET_BODY,
             entity_name="robot",
