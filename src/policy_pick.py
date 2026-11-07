@@ -1762,11 +1762,15 @@ def pick_curriculum(env, env_ids):
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
 
-    # Hold phase (step 0 to 16k, iter 0 to 667): all three axes at the easy endpoint so the
+    # Hold phase (step 0 to 24k, iter 0 to 1000): all three axes at the easy endpoint so the
     # policy learns the base lift-from-SQUAT_GRIP motion before any ramping starts.
-    # Ramp phase (step 16k to 96k, iter 667 to 4000): all axes smoothstep together.
-    HOLD_END = 16_000
-    RAMP_END = 96_000
+    # Ramp phase (step 24k to 144k, iter 1000 to 6000): all axes smoothstep together.
+    # Extended from 4000 to 6000 iters and hold from 667 to 1000 so the policy keeps tracking
+    # the v_abs/v_rel command as body_bias ramps to 0; the 2026-11-07_18-41-30 run showed
+    # track_v_abs collapsing from 0.66 at iter 1000 (body_bias ~= 1) to 0.12 at iter 4000
+    # (body_bias = 0) without recovering.
+    HOLD_END = 24_000
+    RAMP_END = 144_000
     if step < HOLD_END:
         frac = 0.0
     elif step < RAMP_END:
@@ -2027,12 +2031,12 @@ def build_g1_pick_mdp():
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
         # Cooperative bimanual velocity tracking (Uchiyama-Caccavale decomposition). Replaces hand_approach_vel and box_lift_vel: a commanded v_abs upper-bounds the grasp-midpoint speed at every phase, and a commanded v_rel = 0 preserves the internal grasp (sampled non-zero on a fraction of envs so the policy still learns to converge pre-grasp from asymmetric resets). sigma=0.25 m/s matches the half-range of the command box.
         "track_v_abs": RewardTermCfg(
-            func=track_v_abs_reward, weight=2.0,
+            func=track_v_abs_reward, weight=10.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "command_name": "grasp", "sigma": 0.25},
         ),
         "track_v_rel": RewardTermCfg(
-            func=track_v_rel_reward, weight=1.0,
+            func=track_v_rel_reward, weight=5.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "command_name": "grasp", "sigma": 0.25},
         ),
