@@ -68,13 +68,13 @@ TASK_ID = "Mjlab-G1-Pick"
 SNAPSHOT_ENTITIES = ["robot", "box"]
 SNAPSHOT_YAW_ALIGN = True
 
-# Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). History: enabling use_mirror_loss on top of DUP previously added a second gradient that fought PPO and produced a biased fixed point in the carry training (visible spine tilt + asymmetric elbows); if this pick run regresses the same way (spine tilt / asymmetric elbows), fall back to use_mirror_loss=False, mirror_loss_coeff=0.0.
+# Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). Match the walk/carry/drop config: use_data_augmentation only. History: enabling use_mirror_loss on top of DUP has failed three times in this repo (carry regression with spine tilt and asymmetric elbows; pick run 2026-11-19_02-53-36 collapsed after curriculum ramp with Policy/mean_std diverging to 70 and Loss/symmetry growing 10x); each time the extra gradient fought PPO and the policy destabilized once the primary reward signal weakened. Do not re-enable without an architectural change.
 # Toggle for the whole mirror augmentation pipeline. When False, g1_pick_ppo_runner_cfg() passes symmetry_cfg=None so rsl_rl skips the augmentation path entirely (no mirror obs/action pass, no extra forward).
 USE_MIRROR_AUGMENTATION = True
 SYMMETRY_CFG = {
     "use_data_augmentation": True,
-    "use_mirror_loss": True,
-    "mirror_loss_coeff": 0.5,
+    "use_mirror_loss": False,
+    "mirror_loss_coeff": 0.0,
     "data_augmentation_func": "src.symmetry:mirror_g1_pick",
 }
 
@@ -2297,7 +2297,7 @@ def g1_pick_ppo_runner_cfg():
             hidden_dims=(512, 256, 128),
             activation="elu",
             obs_normalization=True,
-            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "log"},
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.30, "std_type": "scalar"},
         ),
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
