@@ -68,13 +68,13 @@ TASK_ID = "Mjlab-G1-Pick"
 SNAPSHOT_ENTITIES = ["robot", "box"]
 SNAPSHOT_YAW_ALIGN = True
 
-# Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). Match the walk task's config: use_data_augmentation only (PPO converges to equivariance naturally when the reward is symmetric). Enabling use_mirror_loss on top added a second gradient that fought PPO and produced a biased fixed point in the carry training (visible spine tilt + asymmetric elbows).
+# Contract for src.train_loop's symmetry hook: enable rsl_rl mirror data augmentation. The train_loop wires this dict into runner.alg.symmetry at runtime (skipped silently if this attribute is absent). History: enabling use_mirror_loss on top of DUP previously added a second gradient that fought PPO and produced a biased fixed point in the carry training (visible spine tilt + asymmetric elbows); if this pick run regresses the same way (spine tilt / asymmetric elbows), fall back to use_mirror_loss=False, mirror_loss_coeff=0.0.
 # Toggle for the whole mirror augmentation pipeline. When False, g1_pick_ppo_runner_cfg() passes symmetry_cfg=None so rsl_rl skips the augmentation path entirely (no mirror obs/action pass, no extra forward).
 USE_MIRROR_AUGMENTATION = True
 SYMMETRY_CFG = {
     "use_data_augmentation": True,
-    "use_mirror_loss": False,
-    "mirror_loss_coeff": 0.0,
+    "use_mirror_loss": True,
+    "mirror_loss_coeff": 0.5,
     "data_augmentation_func": "src.symmetry:mirror_g1_pick",
 }
 
@@ -923,8 +923,20 @@ def box_lift_velocity_penalty(env, box_cfg, left_hand_cfg, right_hand_cfg,
     return ascent_gate * hold_gate * (w_lin * lin_sq + w_ang * ang_sq)
 
 
-def track_v_abs_reward(env, left_hand_cfg, right_hand_cfg, command_name: str = "grasp", sigma: float = 0.25):
-    """Gaussian tracking of the commanded grasp-midpoint velocity (v_abs) in body-yaw frame."""
+def track_v_abs_reward(env, left_hand_cfg, right_hand_cfg, box_cfg,
+                       command_name: str = "grasp", sigma: float = 0.25,
+                       hold_dist: float = 0.15):
+    """Gaussian tracking of the commanded grasp-midpoint velocity (v_abs) in body-yaw frame.
+
+    Gate hold_gate REMOVIDO (2026-11-08): o gate (hands < 15 cm das pinch anchors)
+    deixava a reward zerada em 90%+ dos steps, fazendo a policy ignorar o comando de
+    velocidade — comprovado pelo grid test em model_3000/5900 que ficou idêntico pros
+    6 valores de v_abs_z. Walk/carry não usam gate e tracking reward ~= 0.7 do max;
+    pick sem gate deve alinhar com esse comportamento. Risco de farming (policy
+    congela em pose canonical pra ganhar cmd=0) é mitigado pelo range do comando com
+    v_abs_z in (-0.1, 0.4) — comando médio é positivo, policy não acerta ficando parada.
+    hold_dist mantido na assinatura por compat, mas ignorado.
+    """
     lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
     v_abs = 0.5 * (lv + rv)
     cmd = env.command_manager.get_command(command_name)[:, :3]
@@ -932,8 +944,13 @@ def track_v_abs_reward(env, left_hand_cfg, right_hand_cfg, command_name: str = "
     return torch.exp(-err_sq / (sigma ** 2))
 
 
-def track_v_rel_reward(env, left_hand_cfg, right_hand_cfg, command_name: str = "grasp", sigma: float = 0.25):
-    """Gaussian tracking of the commanded hand-difference velocity (v_rel = v_L - v_R) in body-yaw frame."""
+def track_v_rel_reward(env, left_hand_cfg, right_hand_cfg, box_cfg,
+                       command_name: str = "grasp", sigma: float = 0.25,
+                       hold_dist: float = 0.15):
+    """Gaussian tracking of the commanded hand-difference velocity (v_rel = v_L - v_R) in
+    body-yaw frame. Gate REMOVIDO (vide track_v_abs_reward). hold_dist mantido na
+    assinatura por compat.
+    """
     lv, rv = _hand_vels_body(env, left_hand_cfg, right_hand_cfg)
     v_rel = lv - rv
     cmd = env.command_manager.get_command(command_name)[:, 3:]
@@ -1762,15 +1779,13 @@ def pick_curriculum(env, env_ids):
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
 
-    # Hold phase (step 0 to 24k, iter 0 to 1000): all three axes at the easy endpoint so the
+    # Hold phase (step 0 to 8k, iter 0 to 333): all three axes at the easy endpoint so the
     # policy learns the base lift-from-SQUAT_GRIP motion before any ramping starts.
-    # Ramp phase (step 24k to 144k, iter 1000 to 6000): all axes smoothstep together.
-    # Extended from 4000 to 6000 iters and hold from 667 to 1000 so the policy keeps tracking
-    # the v_abs/v_rel command as body_bias ramps to 0; the 2026-11-07_18-41-30 run showed
-    # track_v_abs collapsing from 0.66 at iter 1000 (body_bias ~= 1) to 0.12 at iter 4000
-    # (body_bias = 0) without recovering.
-    HOLD_END = 24_000
-    RAMP_END = 144_000
+    # Ramp phase (step 8k to 24k, iter 333 to 1000): all axes smoothstep together.
+    # Compressed from 32k/96k (iter 1333/4000) to fit a 2000-iter training budget while
+    # keeping the original 1:2 hold:ramp proportion.
+    HOLD_END = 8_000
+    RAMP_END = 24_000
     if step < HOLD_END:
         frac = 0.0
     elif step < RAMP_END:
@@ -1778,7 +1793,13 @@ def pick_curriculum(env, env_ids):
     else:
         frac = 1.0
 
-    body_bias       = 1.0 - frac
+    # Floor body_bias at 0.5 so reset is always a hybrid pose (half SQUAT_GRIP + half
+    # walk-buffer lerp) instead of going to pure walk-buffer. Pure walk-buffer kills the
+    # track_v_abs gate signal (hands too far from box for most of the episode), producing
+    # the cascade collapse observed in both 2026-11-07_23-57-46 and 2026-11-08_04-56-35.
+    # Hybrid keeps dense tracking signal always available while still exposing the policy
+    # to walking dynamics.
+    body_bias       = 1.0 - 0.5 * frac
     action_rate_w   = -1.0e-2 + (-2.0e-2 - -1.0e-2) * frac
 
     try:
@@ -2010,9 +2031,12 @@ def build_g1_pick_mdp():
                                                "trunk_cfg": trunk,
                                                "sensor_name": "feet_ground_contact",
                                                "hold_dist": 0.10}),
-        # Fused upright + feet_on_ground stability bundle (weights bumped 1.0 -> 5.0 to fix critic collapse: posture was too small vs task rewards to shape a non-trivial value function).
+        # Weight 1.0 → 0.3 (2026-11-08): episode_reward/stability saturava em ~17.97
+        # (max 20/step) vs track_v_abs ~1.06 — stability tava 17x maior e sufocava o
+        # sinal de tracking. Reduzido pra ~5.4 effective: ainda forte o suficiente pra
+        # evitar critic collapse, mas abre espaço pro policy priorizar track_v_abs/rel.
         "stability": RewardTermCfg(
-            func=stability_bundle_reward, weight=1.0,
+            func=stability_bundle_reward, weight=0.3,
             params={"trunk_cfg": trunk, "pelvis_cfg": pelvis,
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
@@ -2029,16 +2053,26 @@ def build_g1_pick_mdp():
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-5.0e-3),
-        # Cooperative bimanual velocity tracking (Uchiyama-Caccavale decomposition). Replaces hand_approach_vel and box_lift_vel: a commanded v_abs upper-bounds the grasp-midpoint speed at every phase, and a commanded v_rel = 0 preserves the internal grasp (sampled non-zero on a fraction of envs so the policy still learns to converge pre-grasp from asymmetric resets). sigma=0.25 m/s matches the half-range of the command box.
+        # Cooperative bimanual velocity tracking (Uchiyama-Caccavale decomposition), gated on
+        # hands-near-pinch-anchors so the Gaussian only fires post-grasp. Walk/carry pattern:
+        # command compliance pays only in the regime the command actually controls -- pre-grasp
+        # the reward is zero, so the policy cannot farm track_v_abs by freezing in a canonical
+        # pose far from the box (the failure mode observed in 2026-11-07_23-57-46 where 5x
+        # weights produced an inert policy that tracked cmd=0 by not moving). sigma=0.25 m/s
+        # matches the half-range of the command box.
+        # Weights 2.0/1.0 → 6.0/3.0 (2026-11-08): alinha com carry (6.0/6.0) pra dar
+        # peso suficiente contra stability/grip_force que estavam sufocando o tracking.
         "track_v_abs": RewardTermCfg(
-            func=track_v_abs_reward, weight=10.0,
+            func=track_v_abs_reward, weight=6.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "command_name": "grasp", "sigma": 0.25},
+                    "box_cfg": box, "command_name": "grasp", "sigma": 0.25,
+                    "hold_dist": 0.15},
         ),
         "track_v_rel": RewardTermCfg(
-            func=track_v_rel_reward, weight=5.0,
+            func=track_v_rel_reward, weight=3.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "command_name": "grasp", "sigma": 0.25},
+                    "box_cfg": box, "command_name": "grasp", "sigma": 0.25,
+                    "hold_dist": 0.15},
         ),
         # Soft, dense pressure against foot shuffling during grasp: replaces the cfea102 foot_displaced termination (cliff at 6 cm that produced high-variance returns). Weight -1.0 is intentionally modest; both feet at 0.5 m/s slip cost ~ -0.5/step so it competes with hand_approach_vel without freezing legs during approach.
         "foot_slip": RewardTermCfg(
@@ -2263,12 +2297,12 @@ def g1_pick_ppo_runner_cfg():
             hidden_dims=(512, 256, 128),
             activation="elu",
             obs_normalization=True,
-            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.30, "std_type": "scalar"},
+            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "log"},
         ),
         critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
         algorithm=RslRlPpoAlgorithmCfgWithSymmetry(
             value_loss_coef=0.5, use_clipped_value_loss=True, clip_param=0.2,
-            entropy_coef=1e-3,
+            entropy_coef=0.01,
             num_learning_epochs=5, num_mini_batches=4, learning_rate=3e-4, schedule="adaptive",
             gamma=0.99, lam=0.95, desired_kl=0.01, max_grad_norm=1.0,
             symmetry_cfg=SYMMETRY_CFG if USE_MIRROR_AUGMENTATION else None,
