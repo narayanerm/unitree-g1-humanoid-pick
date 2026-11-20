@@ -6,10 +6,10 @@
 """Standalone viewer launcher for the newest g1_pick checkpoint via mjlab viser.
 
 Input:  outputs/logs/g1_pick/<run>/model_*.pt (auto-discovered).
-Output: interactive viser session at http://localhost:8080 with the curriculum locked to the checkpoint iter.
+Output: interactive viser session at http://localhost:8080.
 """
 
-import os, re, sys
+import os, sys
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -25,15 +25,6 @@ policy_pick.register()
 
 ckpt = find_latest_checkpoint("outputs/logs", experiment_hint="g1_pick")
 print(f"checkpoint: {ckpt}")
-
-# Freeze the curriculum at the checkpoint's iter so the viewer reflects the trained regime, not the warmup phase.
-match = re.search(r"model_(\d+)\.pt$", str(ckpt))
-if match:
-    iter_num = int(match.group(1))
-    policy_pick.lock_curriculum_at_iter(iter_num)
-    print(f"curriculum locked at iter {iter_num} (step {iter_num * 24})")
-else:
-    print("warn: could not parse iter from checkpoint filename; curriculum starts fresh")
 
 print(f"OBJECT_XY_JITTER_X   : {policy_pick.OBJECT_XY_JITTER_X}")
 
