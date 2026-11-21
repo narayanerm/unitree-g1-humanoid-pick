@@ -718,22 +718,21 @@ def stability_gate(env, trunk_cfg, sensor_name):
     return (upright & both_feet).float()
 
 
-def hand_to_box_distance_reward(
+def hand_to_anchor_distance_reward(
     env,
     left_hand_cfg: SceneEntityCfg,
     right_hand_cfg: SceneEntityCfg,
     box_cfg: SceneEntityCfg,
-    sigma: float = 0.40,
+    sigma: float = 0.25,
 ):
-    """Ungated dense Gaussian on the minimum hand-to-box-center distance; survives the walk-terminal reset where hands sit ~1 m from the box, providing the gradient that bootstraps approach before stability_gate lets hand_placement fire. Modelled on Omnigrasp's approach-phase reward (Luo et al. 2024).
-    Args: env: RL env; left_hand_cfg/right_hand_cfg: hand entities; box_cfg: box entity; sigma: Gaussian bandwidth in metres (0.40 reaches ~0.08 reward at 1 m, ~1.0 at 0 m).
-    Returns: (num_envs,) tensor in (0, 1].
+    """Ungated bilateral Gaussian on hand-to-pinch-anchor distance. Uses the same side-face anchors (GRASP_NOMINAL_Y out, GRASP_NOMINAL_Z above box center) as the gated hand_placement reach term, so the gradient points the hands to the sides and top of the box instead of its geometric center. Targeting the center produced a shortcut where the policy drove both hands into the box midline, bumped the side face, and farmed grip_force by closing fingers at the wrong altitude.
+    Args: env: RL env; left_hand_cfg/right_hand_cfg: hand entities; box_cfg: box entity; sigma: Gaussian bandwidth in metres (0.25 keeps the kernel sharp enough near the anchor to differentiate wrap-pose from side-bump).
+    Returns: (num_envs,) tensor in (0, 2].
     """
-    box_pos = _entity_pos(env, box_cfg)
-    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - box_pos, dim=-1)
-    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - box_pos, dim=-1)
-    d_min = torch.minimum(dl, dr)
-    return torch.exp(-d_min * d_min / (2.0 * sigma * sigma))
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    two_std2 = 2.0 * sigma * sigma
+    return torch.exp(-dl * dl / two_std2) + torch.exp(-dr * dr / two_std2)
 
 
 def stay_still_penalty(
@@ -821,10 +820,14 @@ def dof_torque_l2(env):
 
 
 def grip_force_reward(env, sensor_name: str = "hand_box_contact",
-                      target_force: float = 5.0):
-    """Reward positive normal force between robot and box, saturating at target_force.
-    Args: env: RL env; sensor_name: ContactSensor name; target_force: N at which reward saturates.
-    Returns: (num_envs,) tensor in [0, 1]. Ground-truth signal that grip is firm.
+                      target_force: float = 5.0,
+                      left_hand_cfg: SceneEntityCfg | None = None,
+                      right_hand_cfg: SceneEntityCfg | None = None,
+                      box_cfg: SceneEntityCfg | None = None,
+                      placement_threshold: float | None = None):
+    """Reward positive normal force between robot and box, saturating at target_force. Optionally gated on both hands being within placement_threshold of the side-face anchors so the policy cannot farm the squeeze reward via an arms-closing shortcut that brushes the box without ever landing at the pinch points; this enforces the sequence "trajectory to anchors then pinch" instead of "farm force by closing elbows".
+    Args: env: RL env; sensor_name: ContactSensor name; target_force: N at which reward saturates; left_hand_cfg/right_hand_cfg/box_cfg: entities needed to compute the placement gate (all required together to enable the gate); placement_threshold: max per-hand distance to its anchor, in metres, for the gate to open (typical 0.08 matches hand_placement.hit).
+    Returns: (num_envs,) tensor in [0, 1].
     """
     sensor = env.scene[sensor_name]
     if sensor.data.force is not None:
@@ -832,7 +835,14 @@ def grip_force_reward(env, sensor_name: str = "hand_box_contact",
         force_sum = force_mag.sum(dim=-1)
     else:
         force_sum = sensor.data.found.sum(dim=-1).float()
-    return torch.clamp(force_sum / target_force, 0.0, 1.0)
+    base = torch.clamp(force_sum / target_force, 0.0, 1.0)
+    if (placement_threshold is None or left_hand_cfg is None
+            or right_hand_cfg is None or box_cfg is None):
+        return base
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
+    gate = ((dl < placement_threshold) & (dr < placement_threshold)).float()
+    return base * gate
 
 
 def hand_approach_velocity_penalty(env, left_hand_cfg, right_hand_cfg, box_cfg,
@@ -1825,11 +1835,11 @@ def build_g1_pick_mdp():
 
     # Task rewards gated on upright torso (<=25 deg) AND both feet in contact; palm-inward and hand_to_box stay ungated.
     rewards = {
-        # Ungated dense approach shaping: exp(-min(d_l, d_r)^2 / 2 sigma^2) on hand-to-box-center distance. Provides the gradient that pulls the hands toward the box from the walk-terminal reset, before stability_gate ever lets hand_placement fire. Modelled on Omnigrasp's approach phase.
-        "hand_to_box": RewardTermCfg(
-            func=hand_to_box_distance_reward, weight=2.0,
+        # Ungated bilateral Gaussian on hand-to-pinch-anchor distance (max 2.0 / step). Pulls both hands to the box side-face anchors used by hand_placement.reach, without stability_gate gating, so the gradient fires from the walk-terminal reset. Replaces the earlier hand-to-box-center variant, which taught the policy to drive both hands into the box midline and farm grip_force via side-face contact at the wrong altitude.
+        "hand_to_anchor": RewardTermCfg(
+            func=hand_to_anchor_distance_reward, weight=2.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                    "box_cfg": box, "sigma": 0.40},
+                    "box_cfg": box, "sigma": 0.25},
         ),
         # Fused reach_left + reach_right + hit_bonus + hold_box into hand_placement_bundle (all shared the same stability_gate and (dl, dr) distances; computed once, weights folded in).
         "hand_placement": RewardTermCfg(
@@ -1846,10 +1856,14 @@ def build_g1_pick_mdp():
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "w_left": 0.5, "w_right": 0.5},
         ),
-        # Real contact-force reward replacing the removed gentle_grasp penalty (which taught weak grip). Saturates at 20 N: 5 N let a 2-3 N barely-touching grip claim 60-80% of the reward with no incentive to squeeze.
+        # Real contact-force reward replacing the removed gentle_grasp penalty (which taught weak grip). Saturates at 20 N: 5 N let a 2-3 N barely-touching grip claim 60-80% of the reward with no incentive to squeeze. Placement-gated: pays only when both wrists are within 8 cm of the side-face anchors, killing the "close elbows into the box midline" shortcut the policy found when the gate was absent.
         "grip_force": RewardTermCfg(func=grip_force_reward, weight=5.0,
                                     params={"sensor_name": "hand_box_contact",
-                                            "target_force": 20.0}),
+                                            "target_force": 20.0,
+                                            "left_hand_cfg": left_hand,
+                                            "right_hand_cfg": right_hand,
+                                            "box_cfg": box,
+                                            "placement_threshold": 0.08}),
         # Lift target with asymmetric z-kernel (broad below to pull up from squat, narrow above to punish overshoot); weight bumped 2.0 -> 4.0.
         "box_at_lift_target_pos":  RewardTermCfg(func=gated_box_at_lift_target_pos_reward,  weight=4.0,
                                                  params={"box_cfg": box, "trunk_cfg": trunk,
