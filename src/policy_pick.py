@@ -145,8 +145,8 @@ assert set(SQUAT_GRIP_POSE.keys()) == set(G1_JOINTS), (
 SQUAT_GRIP_ROOT_POS = (0.0, 0.0, 0.65)
 SQUAT_GRIP_ROOT_ROT = (1.0, 0.0, 0.0, 0.0)  # identity: waist_pitch carries the trunk lean via joints
 
-# Walk-buffer poses have flexed hips/knees that project the femur ~0.20-0.28 m forward of the pelvis. If the pelvis lands at world (0,0) + jitter, the thigh crosses the table front edge (x=0.26) and clips through it. Offset the walk-mode spawn back so the femur has clearance at body_bias=0.
-WALK_MODE_XY_OFFSET = (-0.15, 0.0)
+# Walk-buffer poses have flexed hips/knees that project the femur ~0.20-0.28 m forward of the pelvis. If the pelvis lands at world (0,0) + jitter, the thigh crosses the table front edge (x=0.26) and clips through it. Offset the walk-mode spawn back so the femur has clearance at body_bias=0. With the paired xy_range tightened to +/-0.06 (reset_base params), -0.08 keeps pelvis_x in [-0.14, -0.02] so the worst-case thigh front (0.28 flex) lands at +0.26, just at the table edge. This cuts the average robot-to-box horizontal distance from ~0.66 m (previous -0.15 offset with +/-0.12 jitter) to ~0.59 m, giving the policy a reach-first starting state that stays inside the ~1 s budget before fell_over fires at min_step=50.
+WALK_MODE_XY_OFFSET = (-0.08, 0.0)
 
 
 # Scene and task geometry.
@@ -1958,7 +1958,7 @@ def build_g1_pick_mdp():
             mode="reset",
             params={
                 "buffer_path": WALK_BUFFER_PATH,
-                "xy_range":  (-0.12, 0.12),
+                "xy_range":  (-0.06, 0.06),
                 "yaw_range": (-0.30, 0.30),
                 "asset_cfg": g1_asset,
                 "body_bias": 0.0,
