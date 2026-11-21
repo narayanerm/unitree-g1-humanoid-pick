@@ -30,6 +30,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg, RewardTermCfg
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -717,6 +718,24 @@ def stability_gate(env, trunk_cfg, sensor_name):
     return (upright & both_feet).float()
 
 
+def hand_to_box_distance_reward(
+    env,
+    left_hand_cfg: SceneEntityCfg,
+    right_hand_cfg: SceneEntityCfg,
+    box_cfg: SceneEntityCfg,
+    sigma: float = 0.40,
+):
+    """Ungated dense Gaussian on the minimum hand-to-box-center distance; survives the walk-terminal reset where hands sit ~1 m from the box, providing the gradient that bootstraps approach before stability_gate lets hand_placement fire. Modelled on Omnigrasp's approach-phase reward (Luo et al. 2024).
+    Args: env: RL env; left_hand_cfg/right_hand_cfg: hand entities; box_cfg: box entity; sigma: Gaussian bandwidth in metres (0.40 reaches ~0.08 reward at 1 m, ~1.0 at 0 m).
+    Returns: (num_envs,) tensor in (0, 1].
+    """
+    box_pos = _entity_pos(env, box_cfg)
+    dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - box_pos, dim=-1)
+    dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - box_pos, dim=-1)
+    d_min = torch.minimum(dl, dr)
+    return torch.exp(-d_min * d_min / (2.0 * sigma * sigma))
+
+
 def stay_still_penalty(
     env,
     left_hand_cfg: SceneEntityCfg | None = None,
@@ -1293,9 +1312,11 @@ def body_table_collision_penalty(
 _BOX_FLOOR_LIMIT_Z = TABLE_TOP_Z - 0.12   # box fell off the table
 
 
-def fell_over(env, box_cfg, trunk_cfg, limit_angle: float = math.radians(65.0)):
+def fell_over(env, box_cfg, trunk_cfg,
+              limit_angle: float = math.radians(65.0),
+              min_step: int = 0):
     """Terminate if the torso tilts past limit_angle or the box falls to the floor.
-    Args: env: the RL env; box_cfg: box entity; trunk_cfg: trunk entity; limit_angle: max tilt in radians.
+    Args: env: the RL env; box_cfg: box entity; trunk_cfg: trunk entity; limit_angle: max tilt in radians; min_step: grace period in policy steps before this termination can fire (prevents walk-buffer reset transients from killing the episode before exploration has a chance).
     Returns: (num_envs,) bool tensor of termination flags.
     """
     entity: Entity = env.scene[trunk_cfg.name]
@@ -1304,20 +1325,25 @@ def fell_over(env, box_cfg, trunk_cfg, limit_angle: float = math.radians(65.0)):
     tilted = up_alignment < math.cos(limit_angle)
     box_pos = _entity_pos(env, box_cfg)
     box_fell = box_pos[:, 2] < _BOX_FLOOR_LIMIT_Z
-    return tilted | box_fell
+    past_grace = env.episode_length_buf >= min_step
+    return (tilted | box_fell) & past_grace
 
 
 def body_touched_table(env, sensor_name: str = "body_table_contact",
-                        force_threshold: float = 5.0):
+                        force_threshold: float = 5.0,
+                        min_step: int = 0):
     """Terminate on ground-truth contact between torso/hip/thigh/shin subtree geoms and the table body; catches slump, thigh-on-edge, and collapse-forward without any geometric threshold.
-    Args: env: RL env; sensor_name: ContactSensor name; force_threshold: newtons above which contact counts (used only when the sensor exposes force).
+    Args: env: RL env; sensor_name: ContactSensor name; force_threshold: newtons above which contact counts (used only when the sensor exposes force); min_step: grace period in policy steps before this termination can fire.
     Returns: (num_envs,) bool tensor.
     """
     sensor = env.scene[sensor_name]
     if sensor.data.force is not None:
         force_mag = torch.linalg.norm(sensor.data.force, dim=-1)
-        return (force_mag > force_threshold).any(dim=-1)
-    return (sensor.data.found > 0).any(dim=-1)
+        hit = (force_mag > force_threshold).any(dim=-1)
+    else:
+        hit = (sensor.data.found > 0).any(dim=-1)
+    past_grace = env.episode_length_buf >= min_step
+    return hit & past_grace
 
 
 def box_fell_back(env, box_cfg,
@@ -1593,6 +1619,45 @@ def reset_from_walk_buffer(
     )
 
 
+def _smoothstep(t: float) -> float:
+    """Hermite smoothstep: monotonic C1 S-curve with zero derivative at t=0 and t=1."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+# Target weights for the ramped penalties. Must match the weights set on each RewardTerm at env build time.
+_PENALTY_TARGETS = {
+    "action_rate_l2":   -2.0e-2,
+    "action_2nd_order": -1.0e-2,
+    "dof_vel_l2":       -5.0e-3,
+    "self_collisions":  -1.0,
+}
+# Start every ramped penalty at 10% of target and smoothstep up to full by this many common_step_counter steps.
+# At num_envs=4096 x num_steps_per_env=24, 500k steps ~ 125 PPO iterations -- enough time to escape the walk-terminal collapse without starving regularization long term.
+_PENALTY_RAMP_START_FRAC = 0.10
+_PENALTY_RAMP_STEPS = 500_000
+
+
+def penalty_rampup_curriculum(env, env_ids):
+    """Smoothstep the regularization-penalty weights from 10% to 100% of target over env.common_step_counter in [0, 500k]. Lets the policy explore out of the walk-terminal reset without paying the full action_rate / dof_vel / self_collision cost that otherwise dominates the first iterations and collapses mean_episode_length to ~9 steps.
+    Args: env: RL env; env_ids: unused (curriculum is global).
+    Returns: dict mapping each ramped term name to its current weight (logged).
+    """
+    del env_ids
+    step = int(env.common_step_counter)
+    t = step / _PENALTY_RAMP_STEPS if _PENALTY_RAMP_STEPS > 0 else 1.0
+    frac = _PENALTY_RAMP_START_FRAC + (1.0 - _PENALTY_RAMP_START_FRAC) * _smoothstep(t)
+    out = {}
+    for name, target_w in _PENALTY_TARGETS.items():
+        try:
+            rt_cfg = env.reward_manager.get_term_cfg(name)
+        except Exception:
+            continue
+        rt_cfg.weight = target_w * frac
+        out[name] = torch.tensor(rt_cfg.weight)
+    return out
+
+
 # MDP assembly.
 def build_g1_pick_mdp():
     """Assemble the MDP dict (entities, sensors, obs, actions, rewards, events, terminations, curriculum).
@@ -1758,8 +1823,14 @@ def build_g1_pick_mdp():
         )
     }
 
-    # Task rewards gated on upright torso (<=25 deg) AND both feet in contact; palm-inward stays ungated.
+    # Task rewards gated on upright torso (<=25 deg) AND both feet in contact; palm-inward and hand_to_box stay ungated.
     rewards = {
+        # Ungated dense approach shaping: exp(-min(d_l, d_r)^2 / 2 sigma^2) on hand-to-box-center distance. Provides the gradient that pulls the hands toward the box from the walk-terminal reset, before stability_gate ever lets hand_placement fire. Modelled on Omnigrasp's approach phase.
+        "hand_to_box": RewardTermCfg(
+            func=hand_to_box_distance_reward, weight=2.0,
+            params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
+                    "box_cfg": box, "sigma": 0.40},
+        ),
         # Fused reach_left + reach_right + hit_bonus + hold_box into hand_placement_bundle (all shared the same stability_gate and (dl, dr) distances; computed once, weights folded in).
         "hand_placement": RewardTermCfg(
             func=hand_placement_bundle_reward, weight=1.0,
@@ -1809,10 +1880,6 @@ def build_g1_pick_mdp():
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
         ),
-        # Softened -2.0 -> -0.3: at -2.0 this fought locomotion once body_bias -> 0 (post-curriculum regression in the 2026-08-11_21-59-46 run: reward collapsed from 144 to 90 as fell_over spiked to 15/iter). Kept nonzero for residual arm-jitter suppression during hold.
-        "stay_still":     RewardTermCfg(func=stay_still_penalty,    weight=-0.3,
-                                        params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
-                                                "box_cfg": box, "gate_dist": 0.20}),
         "symmetric_pose": RewardTermCfg(func=symmetric_pose_penalty, weight=-0.3,
                                         params={"left_cfg": left_sym, "right_cfg": right_sym}),
         # Softened from -3e-2 to -2e-2 when the curriculum was dropped in the 2026-11-20 revision. The era-4a baseline -3e-2 starved corrective foot steps at body_bias -> 0 (run 2026-08-11_21-59-46: reward collapsed 144 -> 90 with fell_over spiking to 15/iter); the dropped curriculum used to soften it to -1e-2 during the SQUAT_GRIP hold and ramp to -2e-2 post-ramp. Without the curriculum, training is always at the post-ramp regime (body_bias=0.0 walk-buffer), so -2e-2 matches it.
@@ -1828,10 +1895,13 @@ def build_g1_pick_mdp():
         # pose far from the box (the failure mode observed in 2026-11-07_23-57-46 where 5x
         # weights produced an inert policy that tracked cmd=0 by not moving). sigma=0.25 m/s
         # matches the half-range of the command box.
-        # Weights 2.0/1.0 → 6.0/3.0 (2026-11-08): alinha com carry (6.0/6.0) pra dar
-        # peso suficiente contra stability/grip_force que estavam sufocando o tracking.
+        # Weight 6.0 -> 2.0 (2026-11-20 redesign): at 6.0 the ungated-when-close bimanual
+        # velocity tracking dominated the reward landscape in the walk-terminal regime, so
+        # the policy farmed track_v_abs by matching cmd ~ 0 while standing still far from
+        # the box. Lowered to be comparable to grip_force (5.0) and the new hand_to_box
+        # (2.0) so approach wins over tracking before grasp.
         "track_v_abs": RewardTermCfg(
-            func=track_v_abs_reward, weight=6.0,
+            func=track_v_abs_reward, weight=2.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                     "box_cfg": box, "command_name": "grasp", "sigma": 0.25,
                     "hold_dist": 0.15},
@@ -1933,14 +2003,20 @@ def build_g1_pick_mdp():
     # Terminations.
     terminations = {
         "time_out":  TerminationTermCfg(func=time_out, time_out=True),
+        # min_step=50 (~1 s at 50 Hz policy rate): the walk-buffer reset injects a small
+        # transient in projected gravity and foot contacts that fired fell_over before the
+        # policy could emit a single corrective action, flattening mean_episode_length to
+        # ~9 steps across all 2000 training iterations in the 2026-11-20_20-19-02 run.
         "fell_over": TerminationTermCfg(
-            func=fell_over, params={"box_cfg": box, "trunk_cfg": trunk},
+            func=fell_over,
+            params={"box_cfg": box, "trunk_cfg": trunk, "min_step": 50},
         ),
-        # Kill the "slump / lean onto the tabletop" attractor via ground-truth physics contact between torso / hip / thigh / shin subtree geoms and the table body.
+        # Kill the "slump / lean onto the tabletop" attractor via ground-truth physics contact between torso / hip / thigh / shin subtree geoms and the table body. Same 50-step grace as fell_over to avoid reset-time false positives.
         "body_touched_table": TerminationTermCfg(
             func=body_touched_table,
             params={"sensor_name": body_table_contact_cfg.name,
-                    "force_threshold": 5.0},
+                    "force_threshold": 5.0,
+                    "min_step": 50},
         ),
         # "Grabbed but didn't squeeze": box ever 10 cm above the resting-on-table position and now within 3 cm of it; fires whether the box slipped from hands or was lifted and dropped (min_step=30 grace covers early transient contacts at reset).
         "box_fell_back": TerminationTermCfg(
@@ -1958,7 +2034,16 @@ def build_g1_pick_mdp():
         ),
     }
 
-    curriculum = {}
+    # Smoothstep regularization penalties from 10% to 100% of target over the first 500k env steps.
+    # Only curriculum in the pipeline after the 2026-11-20 revision dropped hand_bias; this one
+    # follows the pattern recommended in the humanoid-parkour RSS-2026 review (ramp penalties with
+    # episode length) rather than ramping task difficulty.
+    curriculum = {
+        "penalty_rampup": CurriculumTermCfg(
+            func=penalty_rampup_curriculum,
+            params={},
+        ),
+    }
 
     # Bimanual v_abs + v_rel command, body-yaw frame, resampled every 3-8 s to match the walk twist cadence.
     commands = {
